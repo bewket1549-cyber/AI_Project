@@ -1,0 +1,7 @@
+admin_auth.sqlite3
+admin_auth.sqlite3-shm
+admin_auth.sqlite3-wal
+phone_popularity.sqlite3
+phone_popularity.sqlite3-shm
+phone_popularity.sqlite3-wal
+*.tmp

@@ -1,6 +1,8 @@
 import React, { useEffect, useState } from "react";
 import axios from "axios";
 import "./App.css";
+import AdminPanel from "./AdminPanel";
+import WelcomeScreen from "./WelcomeScreen";
 
 const API_URL = process.env.REACT_APP_API_URL || "http://127.0.0.1:8000";
 const PAGE_SIZE = 24;
@@ -9,20 +11,20 @@ const translations = {
   en: {
     eyebrow: "SMARTPHONE FINDER",
     title: "Find your next phone",
-    subtitle: "Compare phone specifications with catalog prices converted to USD.",
+    subtitle: "Find a phone by budget or specifications.",
     budgetMode: "By budget",
     specsMode: "By specifications",
     bothMode: "Budget + specs",
     budgetTitle: "Start with your budget",
     specsTitle: "Choose what matters",
     bothTitle: "Combine budget and specs",
-    budgetHint: "Enter one maximum price or a range such as 300-800 USD.",
+    budgetHint: "Enter the most you want to spend, or choose the catalog's lowest price.",
     specsHint: "Search specifications only. Price filters are disabled in this mode.",
-    bothHint: "Enter one maximum price or a range, then add specifications.",
-    priceInputLabel: "Budget (USD)",
-    pricePlaceholder: "e.g. 800 or 300-800",
-    priceRange: "Catalog range: USD {min} – USD {max}",
-    exchangeNote: "Converted from INR using the reference rate dated {date}; not a US retail price.",
+    bothHint: "Set your maximum budget and add the specifications that matter.",
+    maxPriceLabel: "Maximum budget (USD)",
+    maxPricePlaceholder: "e.g. 800",
+    minPriceButton: "Show lowest-priced phones: USD {min}",
+    maxPriceButton: "Show highest-priced phones: USD {max}",
     model: "Model name",
     modelPlaceholder: "e.g. Galaxy, Redmi, iPhone",
     ram: "RAM",
@@ -38,11 +40,11 @@ const translations = {
     displaySize: "Display size (inches)",
     refreshRate: "Refresh rate (Hz)",
     cameraResolution: "Main camera (MP)",
-    search: "Show matching phones",
+    search: "Find matching phones",
     clear: "Clear filters",
-    budgetRequired: "Enter one maximum price or a minimum-maximum range to search by budget.",
-    invalidRange: "Minimum price cannot be greater than maximum price.",
-    invalidPrice: "Enter a number or a range such as 300-800.",
+    budgetRequired: "Enter a maximum budget or choose the catalog's lowest price.",
+    invalidRange: "Enter a valid budget.",
+    invalidPrice: "Enter a valid price greater than zero.",
     searchModeLabel: "Search mode",
     languageLabel: "Language",
     results: "Matching phones",
@@ -69,24 +71,33 @@ const translations = {
     faceUnlock: "Face unlock",
     classification: "Dataset classification",
     catalog: "2024 source catalog",
+    downloadPdf: "Download results as PDF",
+    downloadingPdf: "Preparing PDF...",
+    pdfError: "Could not create the PDF. Please try again.",
+    downloadPhonePdf: "Download phone PDF",
+    popularTitle: "Most searched phones",
+    popularNote: "Ranked using anonymous, aggregated search counts.",
+    popularEmpty: "Popular recommendations will appear as people search.",
+    popularSearchCount: "searches",
+    popularityError: "Search results loaded, but popularity data could not be updated.",
   },
   am: {
     eyebrow: "የስልክ መፈለጊያ",
     title: "ቀጣዩን ስልክዎን ያግኙ",
-    subtitle: "የስልኮችን መረጃና ወደ ዶላር የተቀየሩ ዋጋዎችን ያወዳድሩ።",
+    subtitle: "በበጀት ወይም በስልክ መረጃ የሚስማማ ስልክ ያግኙ።",
     budgetMode: "በበጀት",
     specsMode: "በመረጃዎች",
     bothMode: "በበጀትና መረጃ",
     budgetTitle: "በበጀትዎ ይጀምሩ",
     specsTitle: "የሚፈልጉትን ይምረጡ",
     bothTitle: "በበጀትና መረጃዎች በአንድነት ይፈልጉ",
-    budgetHint: "አንድ ከፍተኛ ዋጋ ወይም እንደ 300-800 የዋጋ ክልል በዶላር ያስገቡ።",
+    budgetHint: "ከፍተኛ የሚከፍሉትን ዋጋ ያስገቡ ወይም የዝርዝሩን ዝቅተኛ ዋጋ ይምረጡ።",
     specsHint: "ዋጋ ሳያስገቡ በስልክ መረጃዎች ብቻ ይፈልጉ።",
-    bothHint: "አንድ ከፍተኛ ዋጋ ወይም የዋጋ ክልል በዶላር ያስገቡ፤ ከዚያ መረጃዎችን ይምረጡ።",
-    priceInputLabel: "በጀት (USD)",
-    pricePlaceholder: "ለምሳሌ 800 ወይም 300-800",
-    priceRange: "የዝርዝሩ የዋጋ ክልል፦ USD {min} – USD {max}",
-    exchangeNote: "ከINR ወደ USD ተቀይሯል፤ የልወጣ ቀን {date} ነው። ይህ የUS ችርቻሮ ዋጋ አይደለም።",
+    bothHint: "ከፍተኛ የሚከፍሉትን ዋጋ ያስገቡና የሚፈልጉትን መረጃ ይምረጡ።",
+    maxPriceLabel: "ከፍተኛ በጀት (USD)",
+    maxPricePlaceholder: "ለምሳሌ 800",
+    minPriceButton: "በዝቅተኛ ዋጋ ያሉ ስልኮችን አሳይ፦ USD {min}",
+    maxPriceButton: "በከፍተኛ ዋጋ ያሉ ስልኮችን አሳይ፦ USD {max}",
     model: "የሞዴል ስም",
     modelPlaceholder: "ለምሳሌ Galaxy፣ Redmi፣ iPhone",
     ram: "RAM",
@@ -104,9 +115,9 @@ const translations = {
     cameraResolution: "ዋና ካሜራ (MP)",
     search: "የሚመሳሰሉ ስልኮችን ፈልግ",
     clear: "ማጣሪያዎችን አጽዳ",
-    budgetRequired: "በበጀት ለመፈለግ አንድ ከፍተኛ ዋጋ ወይም ዝቅተኛ-ከፍተኛ ክልል ያስገቡ።",
-    invalidRange: "ዝቅተኛው ዋጋ ከከፍተኛው መብለጥ አይችልም።",
-    invalidPrice: "ቁጥር ወይም እንደ 300-800 ያለ ክልል ያስገቡ።",
+    budgetRequired: "ከፍተኛ በጀት ያስገቡ ወይም የዝርዝሩን ዝቅተኛ ዋጋ ይምረጡ።",
+    invalidRange: "ትክክለኛ በጀት ያስገቡ።",
+    invalidPrice: "ከዜሮ በላይ የሆነ ትክክለኛ ዋጋ ያስገቡ።",
     searchModeLabel: "የፍለጋ አይነት",
     languageLabel: "ቋንቋ",
     results: "የተገኙ ስልኮች",
@@ -133,11 +144,20 @@ const translations = {
     faceUnlock: "በፊት መክፈቻ",
     classification: "የዳታ ምደባ",
     catalog: "የ2024 መነሻ ዳታ",
+    downloadPdf: "ውጤቶቹን በPDF አውርድ",
+    downloadingPdf: "PDF በማዘጋጀት ላይ...",
+    pdfError: "PDF ማዘጋጀት አልተቻለም። እንደገና ይሞክሩ።",
+    downloadPhonePdf: "የስልኩን PDF አውርድ",
+    popularTitle: "ብዙ ጊዜ የተፈለጉ ስልኮች",
+    popularNote: "ደረጃው በስም ወይም IP የማይለይ የተጠቃለለ የፍለጋ ብዛት ላይ የተመሰረተ ነው።",
+    popularEmpty: "ተጠቃሚዎች ሲፈልጉ ታዋቂ ስልኮች እዚህ ይታያሉ።",
+    popularSearchCount: "ፍለጋ",
+    popularityError: "የፍለጋ ውጤቶቹ ተጭነዋል፣ ግን የታዋቂነት መረጃ ማዘመን አልተቻለም።",
   },
 };
 
 const emptyFilters = {
-  price_range: "",
+  max_price: "",
   model: "",
   ram_gb: "",
   storage_gb: "",
@@ -149,15 +169,6 @@ const emptyFilters = {
   operating_system: "",
 };
 
-const parseBudgetRange = (value) => {
-  const parts = value.trim().split(/\s*(?:-|–|to)\s*/i);
-  if (parts.length > 2 || parts.some((part) => part === "")) return null;
-  const prices = parts.map((part) => Number(part.replace(/[$,\s]/g, "")));
-  if (prices.some((price) => !Number.isFinite(price) || price <= 0)) return null;
-  if (prices.length === 1) return { min_price: "", max_price: String(prices[0]) };
-  return { min_price: String(prices[0]), max_price: String(prices[1]) };
-};
-
 const getStorageLabel = (phone, notListed) => {
   const storage = phone.storage == null ? "" : String(phone.storage).trim();
   if (storage && !["unknown", "n/a", "na"].includes(storage.toLowerCase())) return storage;
@@ -166,6 +177,12 @@ const getStorageLabel = (phone, notListed) => {
 
 function App() {
   const [language, setLanguage] = useState("en");
+  const [screen, setScreen] = useState("welcome");
+  const [adminToken, setAdminToken] = useState("");
+  const [exportingPdf, setExportingPdf] = useState(false);
+  const [pdfError, setPdfError] = useState(false);
+  const [popularityError, setPopularityError] = useState(false);
+  const [popularPhones, setPopularPhones] = useState([]);
   const [mode, setMode] = useState("budget");
   const [filters, setFilters] = useState(emptyFilters);
   const [options, setOptions] = useState({
@@ -198,12 +215,14 @@ function App() {
     Promise.all([
       axios.get(`${API_URL}/phones/options`),
       axios.get(`${API_URL}/phones`, { params: { limit: PAGE_SIZE, offset: 0 } }),
+      axios.get(`${API_URL}/phones/popular`),
     ])
-      .then(([optionsResponse, phonesResponse]) => {
+      .then(([optionsResponse, phonesResponse, popularResponse]) => {
         if (!active) return;
         setOptions(optionsResponse.data);
         setPhones(phonesResponse.data.items);
         setTotal(phonesResponse.data.total);
+        setPopularPhones(popularResponse.data.items);
       })
       .catch(() => {
         if (active) setError(true);
@@ -221,6 +240,18 @@ function App() {
     setValidationError("");
   };
 
+  const refreshPhoneOptions = async () => {
+    const [optionsResponse, phonesResponse, popularResponse] = await Promise.all([
+      axios.get(`${API_URL}/phones/options`),
+      axios.get(`${API_URL}/phones`, { params: { limit: PAGE_SIZE, offset: 0 } }),
+      axios.get(`${API_URL}/phones/popular`),
+    ]);
+    setOptions(optionsResponse.data);
+    setPhones(phonesResponse.data.items);
+    setTotal(phonesResponse.data.total);
+    setPopularPhones(popularResponse.data.items);
+  };
+
   const requestParams = (values, offset = 0) => {
     const params = { limit: PAGE_SIZE, offset };
     Object.entries(values).forEach(([key, value]) => {
@@ -229,7 +260,7 @@ function App() {
     return params;
   };
 
-  const searchFilterValues = (values) => {
+  const searchFilterValues = (values, searchMode) => {
     const specificationFields = [
       "model",
       "ram_gb",
@@ -241,44 +272,35 @@ function App() {
       "processor",
       "operating_system",
     ];
-    const fields = mode === "budget"
+    const fields = searchMode === "budget"
       ? []
-      : mode === "specs"
+      : searchMode === "specs"
         ? specificationFields
         : specificationFields;
     const params = Object.fromEntries(fields.filter((key) => values[key] !== "").map((key) => [key, values[key]]));
-    if (mode !== "specs" && values.price_range.trim()) {
-      const priceRange = parseBudgetRange(values.price_range);
-      const rate = options.inr_to_usd_rate;
-      if (priceRange.min_price) params.min_price = String(Math.round(Number(priceRange.min_price) / rate));
-      if (priceRange.max_price) params.max_price = String(Math.round(Number(priceRange.max_price) / rate));
+    if (searchMode !== "specs") {
+      if (values.max_price.trim()) params.max_price = values.max_price;
     }
     return params;
   };
 
-  const searchPhones = async (event, values = filters) => {
+  const searchPhones = async (event, values = filters, searchMode = mode) => {
     if (event) event.preventDefault();
-    if (mode === "budget" && !values.price_range.trim()) {
+    if (searchMode === "budget" && !values.max_price.trim()) {
       setValidationError("budget");
       return;
     }
-    if (mode !== "specs" && values.price_range.trim()) {
-      const priceRange = parseBudgetRange(values.price_range);
-      if (!priceRange) {
-        setValidationError("price");
-        return;
-      }
+    if (searchMode !== "specs") {
+      const maximumPrice = values.max_price.trim() ? Number(values.max_price) : null;
       if (
-        priceRange.min_price &&
-        priceRange.max_price &&
-        Number(priceRange.min_price) > Number(priceRange.max_price)
+        maximumPrice !== null && (!Number.isFinite(maximumPrice) || maximumPrice <= 0)
       ) {
-        setValidationError("range");
+        setValidationError("price");
         return;
       }
     }
     setValidationError("");
-    const params = searchFilterValues(values);
+    const params = searchFilterValues(values, searchMode);
     setActiveSearchParams(params);
     setLoading(true);
     setError(false);
@@ -289,6 +311,16 @@ function App() {
       });
       setPhones(response.data.items);
       setTotal(response.data.total);
+      setPopularityError(false);
+      if (Object.keys(params).length > 0) {
+        try {
+          await axios.post(`${API_URL}/phones/search-interest`, params);
+          const popularResponse = await axios.get(`${API_URL}/phones/popular`);
+          setPopularPhones(popularResponse.data.items);
+        } catch {
+          setPopularityError(true);
+        }
+      }
     } catch (requestError) {
       setError(true);
       setPhones([]);
@@ -312,6 +344,29 @@ function App() {
     searchPhones(null, emptyFilters);
   };
 
+  const searchPopularPhone = (phone) => {
+    const nextFilters = { ...emptyFilters, model: phone.model };
+    setMode("specs");
+    setFilters(nextFilters);
+    searchPhones(null, nextFilters, "specs");
+  };
+
+  const searchLowestPricePhones = () => {
+    const maximumPrice = String(options.min_price);
+    const nextFilters = { ...filters, max_price: maximumPrice };
+    setFilters(nextFilters);
+    setMode("budget");
+    searchPhones(null, nextFilters, "budget");
+  };
+
+  const searchHighestPricePhones = () => {
+    const maximumPrice = String(options.max_price);
+    const nextFilters = { ...filters, max_price: maximumPrice };
+    setFilters(nextFilters);
+    setMode("budget");
+    searchPhones(null, nextFilters, "budget");
+  };
+
   const loadMore = async () => {
     setLoadingMore(true);
     setError(false);
@@ -328,6 +383,34 @@ function App() {
     }
   };
 
+  const downloadPdf = async (phone = null) => {
+    setExportingPdf(true);
+    setPdfError(false);
+    try {
+      const response = await axios.get(
+        phone ? `${API_URL}/phones/${phone.phone_id}/pdf` : `${API_URL}/phones/export/pdf`,
+        {
+        params: phone ? undefined : activeSearchParams,
+        responseType: "blob",
+        }
+      );
+      const url = window.URL.createObjectURL(response.data);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = phone
+        ? `${phone.model.replace(/[^A-Za-z0-9._-]+/g, "-")}.pdf`
+        : "mela-smartphone-catalog.pdf";
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+    } catch (requestError) {
+      setPdfError(true);
+    } finally {
+      setExportingPdf(false);
+    }
+  };
+
   const field = (name, label, content, className = "") => (
     <div className={`filter-field ${className}`}>
       <label htmlFor={name}>{label}</label>
@@ -339,6 +422,30 @@ function App() {
     .replace("{shown}", phones.length.toLocaleString())
     .replace("{total}", total.toLocaleString());
 
+  if (screen === "welcome") {
+    return (
+      <WelcomeScreen
+        language={language}
+        onContinue={() => setScreen("finder")}
+        onAdmin={() => setScreen("admin")}
+        onLanguageChange={setLanguage}
+      />
+    );
+  }
+
+  if (screen === "admin") {
+    return (
+      <AdminPanel
+        adminToken={adminToken}
+        language={language}
+        onAuthenticated={setAdminToken}
+        onBack={() => setScreen("finder")}
+        onCatalogChange={refreshPhoneOptions}
+        onLanguageChange={setLanguage}
+      />
+    );
+  }
+
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -348,6 +455,7 @@ function App() {
         </a>
         <div className="topbar-meta">
           <span className="catalog-label">{text.catalog}</span>
+          <button type="button" className="admin-open" onClick={() => setScreen("admin")}>Admin</button>
           <div className="language-switch" aria-label={text.languageLabel}>
             <button
               type="button"
@@ -415,7 +523,7 @@ function App() {
             <form className="filters-form" onSubmit={searchPhones}>
               <div className={`filter-grid ${mode}-mode`}>
                 {(mode === "budget" || mode === "both") && <>
-                  {field("price_range", text.priceInputLabel, <div className="input-with-prefix"><span>$</span><input id="price_range" name="price_range" type="text" inputMode="decimal" value={filters.price_range} onChange={updateFilter} placeholder={text.pricePlaceholder} /></div>, "price-field")}
+                  {field("max_price", text.maxPriceLabel, <div className="input-with-prefix"><span>$</span><input id="max_price" name="max_price" type="number" min="0.01" step="0.01" inputMode="decimal" value={filters.max_price} onChange={updateFilter} placeholder={text.maxPricePlaceholder} /></div>)}
                 </>}
                 {(mode === "specs" || mode === "both") && <>
                   {field("model", text.model, <input id="model" name="model" type="search" list="model-options" value={filters.model} onChange={updateFilter} placeholder={text.modelPlaceholder} />, "model-field")}
@@ -435,16 +543,14 @@ function App() {
                 </>}
               </div>
               {(mode === "budget" || mode === "both") && (
-                <p className="price-range-note">
-                  {text.priceRange
-                    .replace("{min}", (options.min_price * options.inr_to_usd_rate).toLocaleString("en-US", { maximumFractionDigits: 0 }))
-                    .replace("{max}", (options.max_price * options.inr_to_usd_rate).toLocaleString("en-US", { maximumFractionDigits: 0 }))}
-                </p>
-              )}
-              {(mode === "budget" || mode === "both") && (
-                <p className="exchange-note">
-                  {text.exchangeNote.replace("{date}", options.exchange_rate_date)}
-                </p>
+                <div className="price-range-note">
+                  <button className="min-price-button" type="button" onClick={searchLowestPricePhones}>
+                    {text.minPriceButton.replace("{min}", Number(options.min_price).toLocaleString("en-US", { maximumFractionDigits: 2 }))}
+                  </button>
+                  <button className="min-price-button" type="button" onClick={searchHighestPricePhones}>
+                    {text.maxPriceButton.replace("{max}", Number(options.max_price).toLocaleString("en-US", { maximumFractionDigits: 2 }))}
+                  </button>
+                </div>
               )}
               {validationError && (
                 <p className="validation-message" role="alert">
@@ -477,10 +583,48 @@ function App() {
                 <p className="eyebrow">{text.results}</p>
                 <h2>{shownText}</h2>
               </div>
-              <span className="results-count">{total.toLocaleString()}</span>
+              <div className="results-actions">
+                <button className="pdf-button" type="button" onClick={() => downloadPdf()} disabled={exportingPdf}>
+                  {exportingPdf ? text.downloadingPdf : text.downloadPdf}
+                </button>
+                <span className="results-count">{total.toLocaleString()}</span>
+              </div>
             </div>
 
             {error && <p className="error-message" role="alert">{text.error}</p>}
+            {pdfError && <p className="error-message" role="alert">{text.pdfError}</p>}
+            {popularityError && <p className="error-message" role="alert">{text.popularityError}</p>}
+            <section className="popular-panel" aria-labelledby="popular-heading">
+              <div className="popular-heading">
+                <h3 id="popular-heading">{text.popularTitle}</h3>
+                <p>{text.popularNote}</p>
+              </div>
+              {popularPhones.length ? (
+                <div className="popular-list">
+                  {popularPhones.map((phone) => (
+                    <button
+                      className="popular-phone"
+                      key={phone.phone_id}
+                      type="button"
+                      onClick={() => searchPopularPhone(phone)}
+                    >
+                      <span>
+                        <strong>{phone.model}</strong>
+                        <small>
+                          {phone.search_count.toLocaleString()} {text.popularSearchCount}
+                        </small>
+                      </span>
+                      <b>
+                        {new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
+                          .format(phone.price_usd)}
+                      </b>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <p className="popular-empty">{text.popularEmpty}</p>
+              )}
+            </section>
             {loading ? (
               <div className="empty-state"><p>{text.loading}</p></div>
             ) : phones.length === 0 ? (
@@ -508,7 +652,7 @@ function App() {
                           <span>{text.price}</span>
                           <strong>
                             {new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" })
-                              .format(phone.price_inr * options.inr_to_usd_rate)}
+                              .format(phone.price_usd)}
                           </strong>
                         </div>
                       </div>
@@ -525,6 +669,14 @@ function App() {
                         <div><span>{text.display}</span><strong>{phone.display || "—"}</strong></div>
                         <div><span>{text.camera}</span><strong>{phone.camera || "—"}</strong></div>
                       </div>
+                      <button
+                        className="phone-pdf-button"
+                        type="button"
+                        onClick={() => downloadPdf(phone)}
+                        disabled={exportingPdf}
+                      >
+                        {exportingPdf ? text.downloadingPdf : text.downloadPhonePdf}
+                      </button>
                       <details className="phone-more">
                         <summary>{text.moreDetails}</summary>
                         <dl>
