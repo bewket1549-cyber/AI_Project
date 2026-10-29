@@ -8,28 +8,61 @@ const emptyPhone = {
   rating: "",
   processor: "",
   operating_system: "",
+  specification: "",
   ram_gb: "",
   storage_gb: "",
   battery_mah: "",
   display_size_inches: "",
   refresh_rate_hz: "",
+  camera: "",
   camera_mp: "",
-  is_original: "Original",
+  memory: "",
+  has_fingerprint: "Not listed",
+  has_face_unlock: "Not listed",
+  market: "US",
+  image_search_url: "",
+  video_search_url: "",
+  gif_search_url: "",
 };
 
 const fields = [
-  ["model", "model"],
-  ["price_usd", "price"],
-  ["rating", "rating"],
-  ["processor", "processor"],
-  ["operating_system", "operatingSystem"],
-  ["ram_gb", "ram"],
-  ["storage_gb", "storage"],
-  ["battery_mah", "battery"],
-  ["display_size_inches", "displaySize"],
-  ["refresh_rate_hz", "refreshRate"],
-  ["camera_mp", "camera"],
+  ["model", "model", "text", true],
+  ["price_usd", "price", "number", true],
+  ["rating", "rating", "number", true],
+  ["processor", "processor", "text", true],
+  ["operating_system", "operatingSystem", "text", false],
+  ["specification", "specification", "text", false],
+  ["ram_gb", "ram", "number", true],
+  ["storage_gb", "storage", "number", true],
+  ["battery_mah", "battery", "number", true],
+  ["display_size_inches", "displaySize", "number", true],
+  ["refresh_rate_hz", "refreshRate", "number", true],
+  ["camera", "cameraDetails", "text", false],
+  ["camera_mp", "camera", "number", true],
+  ["memory", "memory", "text", false],
+  ["market", "market", "text", false],
+  ["image_search_url", "imageUrl", "text", false],
+  ["video_search_url", "videoUrl", "text", false],
+  ["gif_search_url", "gifUrl", "text", false],
 ];
+
+const datasetOptionsByField = {
+  model: "models",
+  price_usd: "prices",
+  rating: "ratings",
+  processor: "processors",
+  operating_system: "operating_systems",
+  specification: "specifications",
+  ram_gb: "ram_gb",
+  storage_gb: "storage_gb",
+  battery_mah: "battery_mah",
+  display_size_inches: "display_size_inches",
+  refresh_rate_hz: "refresh_rate_hz",
+  camera: "cameras",
+  camera_mp: "camera_mp",
+  memory: "memories",
+  market: "markets",
+};
 
 const adminTranslations = {
   en: {
@@ -60,7 +93,6 @@ const adminTranslations = {
     searchModel: "Search by model",
     selectPhone: "Select a phone to edit...",
     catalogEntries: "catalog entries",
-    dateAdded: "Date added",
     editPhone: "Edit phone",
     newPhone: "Add a new phone",
     model: "Model",
@@ -74,9 +106,18 @@ const adminTranslations = {
     displaySize: "Display size (inches)",
     refreshRate: "Refresh rate (Hz)",
     camera: "Main camera (MP)",
-    classification: "Dataset classification",
-    original: "Original",
-    fake: "Fake/Replica",
+    specification: "Network and features",
+    cameraDetails: "Camera description",
+    memory: "Memory / card support",
+    hasFingerprint: "Fingerprint sensor",
+    hasFaceUnlock: "Face unlock",
+    notListed: "Not listed",
+    market: "Market",
+    imageUrl: "Image search URL",
+    videoUrl: "Video search URL",
+    gifUrl: "GIF search URL",
+    yes: "Yes",
+    no: "No",
     saving: "Saving...",
     save: "Save changes",
     addToDataset: "Add to dataset",
@@ -121,7 +162,6 @@ const adminTranslations = {
     searchModel: "በሞዴል ፈልግ",
     selectPhone: "ለማስተካከል ስልክ ይምረጡ...",
     catalogEntries: "ስልኮች",
-    dateAdded: "የተጨመረበት ቀን",
     editPhone: "ስልክ አስተካክል",
     newPhone: "አዲስ ስልክ ጨምር",
     model: "ሞዴል",
@@ -135,9 +175,18 @@ const adminTranslations = {
     displaySize: "የስክሪን መጠን (ኢንች)",
     refreshRate: "የስክሪን ፍጥነት (Hz)",
     camera: "ዋና ካሜራ (MP)",
-    classification: "የዳታ ምደባ",
-    original: "ኦሪጅናል",
-    fake: "ሐሰተኛ/ቅጂ",
+    specification: "ኔትወርክና ተጨማሪ መረጃ",
+    cameraDetails: "የካሜራ መግለጫ",
+    memory: "ማህደር / የማስታወሻ ካርድ",
+    hasFingerprint: "የጣት አሻራ ማንበቢያ",
+    hasFaceUnlock: "በፊት መክፈቻ",
+    notListed: "በዳታው ውስጥ የለም",
+    market: "ገበያ",
+    imageUrl: "የምስል ፍለጋ URL",
+    videoUrl: "የቪዲዮ ፍለጋ URL",
+    gifUrl: "የGIF ፍለጋ URL",
+    yes: "አዎ",
+    no: "አይ",
     saving: "በማስቀመጥ ላይ...",
     save: "ለውጦችን አስቀምጥ",
     addToDataset: "ወደ ዳታው ጨምር",
@@ -164,8 +213,20 @@ const getErrorMessage = (error, language) =>
     503: adminTranslations[language].serviceUnavailable,
   }[error.response?.status] || error.response?.data?.detail || adminTranslations[language].requestFailed);
 
-function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageChange, onCatalogChange }) {
+function AdminPanel({
+  adminToken,
+  onAuthenticated,
+  onBack,
+  language,
+  onLanguageChange,
+  onCatalogChange,
+  options = {},
+}) {
   const text = adminTranslations[language];
+  const sensorChoices = [
+    ["has_fingerprint", text.hasFingerprint, options.has_fingerprint || []],
+    ["has_face_unlock", text.hasFaceUnlock, options.has_face_unlock || []],
+  ];
   const [accountConfigured, setAccountConfigured] = useState(null);
   const [authMode, setAuthMode] = useState("loading");
   const [fullName, setFullName] = useState("");
@@ -174,7 +235,6 @@ function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageC
   const [confirmPassword, setConfirmPassword] = useState("");
   const [phones, setPhones] = useState([]);
   const [selectedPhoneId, setSelectedPhoneId] = useState("");
-  const [selectedPhoneDate, setSelectedPhoneDate] = useState("");
   const [filter, setFilter] = useState("");
   const [form, setForm] = useState(emptyPhone);
   const [error, setError] = useState("");
@@ -218,23 +278,39 @@ function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageC
     };
   }, [adminToken, language]);
 
-  const filteredPhones = useMemo(() => {
+  const sortedPhones = useMemo(() => {
     const query = filter.trim().toLowerCase();
-    const filtered = query
-      ? phones.filter((phone) => phone.model.toLowerCase().includes(query))
+    const queryTokens = query.split(/[^a-z0-9]+/).filter(Boolean);
+    const filteredPhones = query
+      ? phones.filter((phone) => {
+        const modelTokens = phone.model.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+        return queryTokens.every((queryToken) => modelTokens.some((modelToken) => {
+          if (modelToken.includes(queryToken) || queryToken.includes(modelToken)) return true;
+          if (queryToken.length < 3) return false;
+          const previous = Array.from({ length: modelToken.length + 1 }, (_, index) => index);
+          for (let row = 1; row <= queryToken.length; row += 1) {
+            const current = [row];
+            for (let column = 1; column <= modelToken.length; column += 1) {
+              current[column] = Math.min(
+                current[column - 1] + 1,
+                previous[column] + 1,
+                previous[column - 1] + (queryToken[row - 1] === modelToken[column - 1] ? 0 : 1)
+              );
+            }
+            previous.splice(0, previous.length, ...current);
+          }
+          return 1 - previous[modelToken.length] / Math.max(queryToken.length, modelToken.length) >= 0.72;
+        }));
+      })
       : phones;
-    return [...filtered].sort((first, second) => {
-      if (first.date_added && second.date_added && first.date_added !== second.date_added) {
-        return second.date_added.localeCompare(first.date_added);
-      }
-      if (first.date_added !== second.date_added) return first.date_added ? -1 : 1;
-      return first.model.localeCompare(second.model, undefined, { sensitivity: "base" });
-    });
+    return [...filteredPhones].sort((first, second) =>
+      first.model.localeCompare(second.model, undefined, { sensitivity: "base" })
+    );
   }, [filter, phones]);
 
   const beginNewPhone = () => {
     setSelectedPhoneId("");
-    setSelectedPhoneDate("");
+    setFilter("");
     setForm({ ...emptyPhone });
     setError("");
     setNotice("");
@@ -259,7 +335,6 @@ function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageC
         Object.entries(response.data).filter(([key]) => key !== "phone_id")
           .map(([key, value]) => [key, String(value)])
       ));
-      setSelectedPhoneDate(response.data.date_added || "");
     } catch (requestError) {
       setError(getErrorMessage(requestError, language));
     } finally {
@@ -412,7 +487,7 @@ function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageC
           )}
         </div>
       </header>
-      <main className="admin-content">
+      <main className={`admin-content ${adminToken ? "admin-content-authenticated" : ""}`}>
         {!adminToken ? (
           authMode === "loading" ? (
             <section className={`admin-login ${language === "am" ? "amharic" : ""}`}><p>{text.checking}</p></section>
@@ -503,12 +578,14 @@ function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageC
               <div>
                 <p className="eyebrow">{text.catalogEyebrow}</p>
                 <h1>{text.manage}</h1>
+                <p>{phones.length.toLocaleString()} {text.catalogEntries}</p>
               </div>
               <button className="welcome-primary" type="button" onClick={beginNewPhone}>{text.addPhone}</button>
             </div>
             <div className="admin-editor">
               <aside className="admin-selector">
-                <label htmlFor="phone-filter">{text.findPhone}</label>
+                <h2>{text.findPhone}</h2>
+                <label htmlFor="phone-filter">{text.searchModel}</label>
                 <input
                   id="phone-filter"
                   type="search"
@@ -517,42 +594,59 @@ function AdminPanel({ adminToken, onAuthenticated, onBack, language, onLanguageC
                   placeholder={text.searchModel}
                 />
                 <select id="phone-select" size="14" value={selectedPhoneId} onChange={selectPhone}>
-                  <option value="">{text.selectPhone}</option>
-                  {filteredPhones.map((phone) => (
+                  <option value="">{text.newPhone}</option>
+                  {sortedPhones.map((phone) => (
                     <option key={phone.phone_id} value={phone.phone_id}>
-                      {phone.model}{phone.date_added ? ` (${phone.date_added})` : ""}
+                      {phone.model}
                     </option>
                   ))}
                 </select>
-                {selectedPhoneDate && <p>{text.dateAdded}: {selectedPhoneDate}</p>}
-                <p>{phones.length.toLocaleString()} {text.catalogEntries}</p>
               </aside>
               <form className={`admin-form ${language === "am" ? "amharic" : ""}`} onSubmit={savePhone}>
                 <h2>{selectedPhoneId ? `${text.editPhone} #${selectedPhoneId}` : text.newPhone}</h2>
                 <div className="admin-form-grid">
-                  {fields.map(([name, label]) => (
+                  {fields.map(([name, label, type, required]) => (
                     <div className="filter-field" key={name}>
                       <label htmlFor={`admin-${name}`}>{text[label]}</label>
                       <input
                         id={`admin-${name}`}
                         name={name}
-                        type={["model", "processor", "operating_system"].includes(name) ? "text" : "number"}
+                        type={type}
                         min={name === "rating" ? "0" : undefined}
                         max={name === "rating" ? "100" : undefined}
-                        step={name === "display_size_inches" || name === "price_usd" ? "0.01" : "1"}
+                        step={name === "display_size_inches" || name === "price_usd" || name === "rating" ? "0.01" : "1"}
+                        list={
+                          (options[datasetOptionsByField[name]] || []).length
+                            ? `admin-${name}-options`
+                            : undefined
+                        }
                         value={form[name]}
                         onChange={updateForm}
-                        required
+                        required={required}
                       />
                     </div>
                   ))}
-                  <div className="filter-field">
-                    <label htmlFor="admin-is_original">{text.classification}</label>
-                    <select id="admin-is_original" name="is_original" value={form.is_original} onChange={updateForm}>
-                      <option value="Original">{text.original}</option>
-                      <option value="Fake/Replica">{text.fake}</option>
-                    </select>
-                  </div>
+                  {Object.entries(datasetOptionsByField).map(([name, optionKey]) => (
+                    (options[optionKey] || []).length > 0 && (
+                      <datalist id={`admin-${name}-options`} key={name}>
+                        {options[optionKey].map((value) => (
+                          <option key={value} value={value} />
+                        ))}
+                      </datalist>
+                    )
+                  ))}
+                  {sensorChoices.map(([name, label, choices]) => (
+                    <div className="filter-field" key={name}>
+                      <label htmlFor={`admin-${name}`}>{label}</label>
+                      <select id={`admin-${name}`} name={name} value={form[name]} onChange={updateForm}>
+                        {choices.map((value) => (
+                          <option key={value} value={value}>
+                            {value === "Yes" ? text.yes : value === "No" ? text.no : text.notListed}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  ))}
                 </div>
                 {error && <p className="error-message" role="alert">{error}</p>}
                 {notice && <p className="admin-notice" role="status">{notice}</p>}

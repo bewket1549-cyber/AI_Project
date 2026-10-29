@@ -8,7 +8,7 @@ import secrets
 import time
 import textwrap
 import unicodedata
-from datetime import datetime, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Literal, Optional
 from urllib.parse import quote_plus
@@ -17,24 +17,44 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from pydantic import BaseModel, Field
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
 
-app = FastAPI(title="Smartphone Authenticity Detection API")
+if __package__:
+    from .recommendation_model import (
+        CATALOG_COLUMNS,
+        LABEL_COLUMN,
+        build_classifier,
+        build_model_features,
+        normalized_model_group,
+        parse_ram_gb,
+        price_values,
+        recommendation_labels,
+    )
+else:
+    from recommendation_model import (
+        CATALOG_COLUMNS,
+        LABEL_COLUMN,
+        build_classifier,
+        build_model_features,
+        normalized_model_group,
+        parse_ram_gb,
+        price_values,
+        recommendation_labels,
+    )
+
+app = FastAPI(title="Smartphone Recommendation API")
 INR_TO_USD_RATE = 0.010513
 EXCHANGE_RATE_DATE = "2026-10-27"
-DATASET_PATH = Path(__file__).with_name("Smartphone_2024_enhanced_4.csv")
+DATASET_PATH = Path(__file__).with_name("Phone_Recommendation_Catalog_Verified.csv")
+TRAINING_DATASET_PATH = Path(__file__).with_name(
+    "Smartphone_Recommendation_Training_Verified.csv"
+)
 AUTH_DATABASE_PATH = Path(__file__).with_name("admin_auth.sqlite3")
 POPULARITY_DATABASE_PATH = Path(__file__).with_name("phone_popularity.sqlite3")
 SESSION_TTL_SECONDS = 8 * 60 * 60
 PASSWORD_ITERATIONS = 310_000
-FEATURES = [
-    "RAM_GB",
-    "Storage_GB",
-    "Battery_mAh",
-    "Display_Size_Inches",
-    "Refresh_Rate_Hz",
-    "Main_Camera_MP",
-]
+TEXT_SEARCH_THRESHOLD = 0.72
+EXPECTED_DATASET_COLUMNS = {*CATALOG_COLUMNS, LABEL_COLUMN}
 
 # Enable CORS for React Frontend
 app.add_middleware(
@@ -45,69 +65,54 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def price_in_inr(dataframe):
-    return pd.to_numeric(
-        dataframe["Price"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-        errors="coerce",
-    )
-
-
 df = pd.read_csv(DATASET_PATH)
-needs_date_added_migration = "Date_Added" not in df.columns
-if needs_date_added_migration:
-    df["Date_Added"] = ""
-touchscreen_flags = df["Touchscreen"].astype(str).str.strip().str.lower().isin(
-    {"true", "yes", "1"}
-)
-display_sizes = pd.to_numeric(df["Display_Size_Inches"], errors="coerce")
-iphone_models = df["Model"].astype(str).str.contains(r"\biphone\b", case=False, na=False)
-touchscreen_evidence = ~touchscreen_flags & ((display_sizes > 3) | iphone_models)
-keypad_phones = ~touchscreen_flags & ~touchscreen_evidence
-needs_touchscreen_cleanup = bool(keypad_phones.any() or touchscreen_evidence.any())
-df = df.loc[~keypad_phones].copy()
-df.loc[touchscreen_evidence.loc[df.index], "Touchscreen"] = True
-empty_msrp_columns = []
-for column in ("US_MSRP_USD", "US_MSRP_SOURCE_URL", "US_MSRP_UPDATED_AT"):
-    if column in df.columns and (
-        df[column].isna().all()
-        or df[column].astype(str).str.strip().eq("").all()
+training_df = pd.read_csv(TRAINING_DATASET_PATH)
+for dataset_name, dataset in (
+    ("catalog", df),
+    ("training", training_df),
+):
+    unexpected_columns = set(dataset.columns).difference(EXPECTED_DATASET_COLUMNS)
+    missing_columns = EXPECTED_DATASET_COLUMNS.difference(dataset.columns)
+    if unexpected_columns:
+        raise ValueError(
+            f"The {dataset_name} dataset contains unexpected columns: "
+            f"{sorted(unexpected_columns)}"
+        )
+    if missing_columns:
+        raise ValueError(
+            f"The {dataset_name} dataset is missing columns: "
+            f"{sorted(missing_columns)}"
+        )
+    if LABEL_COLUMN not in dataset.columns:
+        raise ValueError(f"The {dataset_name} dataset is missing {LABEL_COLUMN}.")
+    if not set(dataset[LABEL_COLUMN].dropna().astype(str)).issubset(
+        {"Recommended", "Not Recommended"}
     ):
-        empty_msrp_columns.append(column)
-needs_empty_msrp_cleanup = bool(empty_msrp_columns)
-if empty_msrp_columns:
-    df = df.drop(columns=empty_msrp_columns)
-price_is_inr = df["Price"].astype(str).str.contains(r"[₹]|INR", case=False, regex=True).any()
-price_usd_values = (
-    pd.to_numeric(df["Price_USD"], errors="coerce")
-    if "Price_USD" in df.columns
-    else pd.Series(dtype=float)
-)
-has_usd_price_column = price_usd_values.notna().any()
-price_is_formatted_usd = df["Price"].astype(str).str.fullmatch(r"\$\d+\.\d{2}").all()
-needs_price_migration = (
-    "Price_USD" in df.columns or price_is_inr or not price_is_formatted_usd
-)
-if has_usd_price_column:
-    df["_price_usd"] = price_usd_values
-elif price_is_inr:
-    df["_price_usd"] = (price_in_inr(df) * INR_TO_USD_RATE).round(2)
-else:
-    df["_price_usd"] = pd.to_numeric(
-        df["Price"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-        errors="coerce",
-    )
-if "Price_USD" in df.columns:
-    df = df.drop(columns=["Price_USD"])
+        raise ValueError(f"The {dataset_name} dataset has invalid recommendation labels.")
+    if dataset[["Has_Fingerprint", "Has_Face_Unlock"]].isna().any().any():
+        raise ValueError(f"The {dataset_name} dataset has missing sensor values.")
+    for column in ("Has_Fingerprint", "Has_Face_Unlock"):
+        if not set(dataset[column].astype(str)).issubset(
+            {"Yes", "No", "Not listed"}
+        ):
+            raise ValueError(
+                f"The {dataset_name} dataset has invalid values in {column}."
+            )
+
+df["_price_usd"] = price_values(df)
+training_df["_price_usd"] = price_values(training_df)
 if df["_price_usd"].isna().any():
     raise ValueError(f"{DATASET_PATH} contains missing or invalid smartphone prices.")
-df["Price"] = df["_price_usd"].map(lambda price: f"${price:.2f}")
-if (
-    needs_price_migration
-    or needs_date_added_migration
-    or needs_touchscreen_cleanup
-    or needs_empty_msrp_cleanup
+if training_df["_price_usd"].isna().any():
+    raise ValueError(
+        f"{TRAINING_DATASET_PATH} contains missing or invalid smartphone prices."
+    )
+if set(df["Model"].map(normalized_model_group)) & set(
+    training_df["Model"].map(normalized_model_group)
 ):
-    df.drop(columns=["_price_usd"]).to_csv(DATASET_PATH, index=False, encoding="utf-8-sig")
+    raise ValueError("A phone model appears in both training and catalog datasets.")
+if df.drop(columns=[LABEL_COLUMN]).duplicated().any():
+    raise ValueError("The user catalog contains duplicate phone records.")
 
 
 @contextlib.contextmanager
@@ -173,13 +178,66 @@ def initialize_popularity_database():
 initialize_popularity_database()
 
 
-def train_model():
-    classifier = RandomForestClassifier(n_estimators=100, random_state=42)
-    classifier.fit(df[FEATURES].apply(pd.to_numeric, errors="coerce").fillna(0), df["Is_Original"])
-    return classifier
+model = build_classifier(training_df)
 
 
-model = train_model()
+def evaluate_model(test_data):
+    test_labels = test_data[LABEL_COLUMN].astype(str)
+    test_predictions = model.predict(build_model_features(test_data))
+    return {
+        "test_rows": int(len(test_data)),
+        "accuracy": round(float(accuracy_score(test_labels, test_predictions)), 4),
+        "precision": round(
+            float(
+                precision_score(
+                    test_labels,
+                    test_predictions,
+                    pos_label="Recommended",
+                    zero_division=0,
+                )
+            ),
+            4,
+        ),
+        "recall": round(
+            float(
+                recall_score(
+                    test_labels,
+                    test_predictions,
+                    pos_label="Recommended",
+                    zero_division=0,
+                )
+            ),
+            4,
+        ),
+        "f1": round(
+            float(
+                f1_score(
+                    test_labels,
+                    test_predictions,
+                    pos_label="Recommended",
+                    zero_division=0,
+                )
+            ),
+            4,
+        ),
+        "training_rows": int(len(training_df)),
+        "training_model_groups": int(training_df["Model"].map(normalized_model_group).nunique()),
+        "test_model_groups": int(test_data["Model"].map(normalized_model_group).nunique()),
+    }
+
+
+model_metrics = evaluate_model(df)
+
+
+@app.get("/model/metrics")
+def get_model_metrics():
+    return {
+        "model": "RandomForestClassifier",
+        "text_features": "TF-IDF word and word-pair features from phone model names",
+        "target": LABEL_COLUMN,
+        "label_source": "Rule-generated weak labels; not human-verified recommendations",
+        **model_metrics,
+    }
 
 
 def persist_dataset(updated_df):
@@ -243,14 +301,22 @@ class AdminPhoneInput(BaseModel):
     price_usd: float = Field(gt=0)
     rating: float = Field(ge=0, le=100)
     processor: str = Field(min_length=1, max_length=120)
-    operating_system: str = Field(min_length=1, max_length=80)
+    operating_system: str = Field(default="", max_length=80)
+    specification: str = Field(default="", max_length=1000)
     ram_gb: int = Field(gt=0, le=1024)
     storage_gb: int = Field(gt=0, le=100000)
     battery_mah: int = Field(gt=0, le=100000)
     display_size_inches: float = Field(gt=0, le=100)
     refresh_rate_hz: int = Field(gt=0, le=1000)
+    camera: str = Field(default="", max_length=300)
     camera_mp: int = Field(gt=0, le=10000)
-    is_original: Literal["Original", "Fake/Replica"]
+    memory: str = Field(default="", max_length=300)
+    has_fingerprint: Literal["Yes", "No", "Not listed"] = "Not listed"
+    has_face_unlock: Literal["Yes", "No", "Not listed"] = "Not listed"
+    market: str = Field(default="US", max_length=80)
+    image_search_url: str = Field(default="", max_length=2000)
+    video_search_url: str = Field(default="", max_length=2000)
+    gif_search_url: str = Field(default="", max_length=2000)
 
 
 class PhoneSearchInterest(BaseModel):
@@ -265,25 +331,41 @@ class PhoneSearchInterest(BaseModel):
     model: Optional[str] = None
     processor: Optional[str] = None
     operating_system: Optional[str] = None
+    rating: Optional[float] = None
+    specification: Optional[str] = None
+    memory: Optional[str] = None
+    market: Optional[str] = None
+    has_fingerprint: Optional[Literal["Yes", "No", "Not listed"]] = None
+    has_face_unlock: Optional[Literal["Yes", "No", "Not listed"]] = None
 
 
 def admin_phone_record(phone):
-    date_added = phone.get("Date_Added", "")
+    def text_value(column):
+        value = phone[column]
+        return "" if pd.isna(value) else str(value)
+
     return {
         "phone_id": int(phone["Phone_ID"]),
-        "model": phone["Model"],
-        "date_added": "" if pd.isna(date_added) else str(date_added),
+        "model": text_value("Model"),
         "price_usd": float(phone["_price_usd"]),
         "rating": float(phone["Rating"]) if pd.notna(phone["Rating"]) else 0,
-        "processor": phone["Processor"],
-        "operating_system": phone["OperatingSystem"],
-        "ram_gb": int(phone["RAM_GB"]),
+        "processor": text_value("Processor"),
+        "operating_system": text_value("OperatingSystem"),
+        "specification": text_value("Specification"),
+        "ram_gb": int(parse_ram_gb(phone["RAM"])),
         "storage_gb": int(phone["Storage_GB"]),
         "battery_mah": int(phone["Battery_mAh"]),
         "display_size_inches": float(phone["Display_Size_Inches"]),
         "refresh_rate_hz": int(phone["Refresh_Rate_Hz"]),
+        "camera": text_value("Camera"),
         "camera_mp": int(phone["Main_Camera_MP"]),
-        "is_original": str(phone["Is_Original"]),
+        "memory": text_value("Memory"),
+        "has_fingerprint": text_value("Has_Fingerprint"),
+        "has_face_unlock": text_value("Has_Face_Unlock"),
+        "market": text_value("Market"),
+        "image_search_url": text_value("Image_Search_URL"),
+        "video_search_url": text_value("Video_Search_URL"),
+        "gif_search_url": text_value("GIF_Search_URL"),
     }
 
 
@@ -294,91 +376,123 @@ def apply_admin_phone(phone, values, phone_id):
     )
     updated.update(
         {
-            "Phone_ID": str(phone_id),
+            "Phone_ID": int(phone_id),
             "Model": values["model"].strip(),
-            "Date_Added": (
-                updated.get("Date_Added")
-                if pd.notna(updated.get("Date_Added"))
-                and str(updated.get("Date_Added")).strip()
-                else datetime.now(timezone.utc).date().isoformat()
-            ),
             "Price": f'${values["price_usd"]:.2f}',
             "Rating": values["rating"],
-            "Specification": (
+            "Specification": values["specification"].strip() or (
                 f'{values["ram_gb"]} GB RAM, {values["storage_gb"]} GB storage, '
-                f'{values["battery_mah"]} mAh battery, touchscreen display'
+                f'{values["battery_mah"]} mAh battery, '
+                f'{values["display_size_inches"]} inch display'
             ),
             "Processor": values["processor"].strip(),
             "OperatingSystem": values["operating_system"].strip(),
             "RAM": f'{values["ram_gb"]} GB RAM',
-            "RAM_GB": values["ram_gb"],
             "Internal_Storage": f'{values["storage_gb"]} GB',
             "Storage_GB": values["storage_gb"],
-            "Battery": f'{values["battery_mah"]} mAh',
             "Battery_mAh": values["battery_mah"],
-            "Display": f'{values["display_size_inches"]} inches, {values["refresh_rate_hz"]} Hz',
             "Display_Size_Inches": values["display_size_inches"],
             "Refresh_Rate_Hz": values["refresh_rate_hz"],
-            "Camera": f'{values["camera_mp"]} MP',
+            "Camera": values["camera"].strip() or f'{values["camera_mp"]} MP',
             "Main_Camera_MP": values["camera_mp"],
-            "Is_Original": values["is_original"],
-            "Touchscreen": "True",
-            "Image_Search_URL": f"https://www.google.com/search?tbm=isch&q={query}",
-            "Video_Search_URL": f"https://www.youtube.com/results?search_query={query}",
-            "GIF_Search_URL": f"https://tenor.com/search/{query}-gifs",
+            "Memory": values["memory"].strip(),
+            "Has_Fingerprint": values["has_fingerprint"].strip(),
+            "Has_Face_Unlock": values["has_face_unlock"].strip(),
+            "Market": values["market"].strip(),
+            "Image_Search_URL": values["image_search_url"].strip()
+            or f"https://www.google.com/search?tbm=isch&q={query}",
+            "Video_Search_URL": values["video_search_url"].strip()
+            or f"https://www.youtube.com/results?search_query={query}",
+            "GIF_Search_URL": values["gif_search_url"].strip()
+            or f"https://tenor.com/search/{query}-gifs",
         }
     )
     return updated
 
 
 def save_admin_dataset(updated_df):
-    global df, model
+    global df
     updated_df["_price_usd"] = pd.to_numeric(
         updated_df["Price"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
         errors="coerce",
     )
     persist_dataset(updated_df)
     df = updated_df
-    model = train_model()
 
 
-class SmartphoneInput(BaseModel):
-    ram_gb: int
-    storage_gb: int
-    battery_mah: int
-    display_size_inches: float
-    refresh_rate_hz: int
-    main_camera_mp: int
+class PhoneRecommendationInput(BaseModel):
+    max_price: Optional[float] = Field(default=None, gt=0)
+    model: Optional[str] = Field(default=None, max_length=120)
+    ram_gb: Optional[int] = Field(default=None, gt=0, le=1024)
+    storage_gb: Optional[int] = Field(default=None, gt=0, le=100000)
+    battery_mah: Optional[int] = Field(default=None, gt=0, le=100000)
+    display_size_inches: Optional[float] = Field(default=None, gt=0, le=100)
+    refresh_rate_hz: Optional[int] = Field(default=None, gt=0, le=1000)
+    camera_mp: Optional[int] = Field(default=None, gt=0, le=10000)
+    rating: Optional[float] = Field(default=None, ge=0, le=100)
+    processor: Optional[str] = Field(default=None, max_length=120)
+    operating_system: Optional[str] = Field(default=None, max_length=80)
+    specification: Optional[str] = Field(default=None, max_length=1000)
+    memory: Optional[str] = Field(default=None, max_length=300)
+    market: Optional[str] = Field(default=None, max_length=80)
+    has_fingerprint: Optional[Literal["Yes", "No", "Not listed"]] = None
+    has_face_unlock: Optional[Literal["Yes", "No", "Not listed"]] = None
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=24, ge=1, le=100)
 
 
 @app.get("/phones/options")
 def get_phone_filter_options():
-    catalog = get_touchscreen_phones()
+    available_phones = pd.concat([df, training_df], ignore_index=True)
 
     def text_options(column):
-        return sorted(value for value in catalog[column].dropna().astype(str).unique() if value)
+        return sorted(
+            value
+            for value in available_phones[column].dropna().astype(str).unique()
+            if value and value != "Not listed"
+        )
 
-    def numeric_options(column, integer=True):
-        values = pd.to_numeric(catalog[column], errors="coerce").dropna().unique()
-        values = sorted(value for value in values if value > 0)
+    def numeric_options(column, integer=True, positive_only=True):
+        values = pd.to_numeric(
+            available_phones[column], errors="coerce"
+        ).dropna().unique()
+        values = sorted(
+            value for value in values if value > 0 or (not positive_only and value == 0)
+        )
         return [int(value) for value in values] if integer else [float(value) for value in values]
 
     return {
-            "ram_gb": sorted(int(value) for value in catalog["RAM_GB"].dropna().unique() if value > 0),
-            "storage_gb": sorted(
-                    int(value) for value in catalog["Storage_GB"].dropna().unique() if value > 0
-            ),
-            "battery_mah": numeric_options("Battery_mAh"),
-            "display_size_inches": numeric_options("Display_Size_Inches", integer=False),
-            "refresh_rate_hz": numeric_options("Refresh_Rate_Hz"),
-            "camera_mp": numeric_options("Main_Camera_MP"),
-            "models": text_options("Model"),
-            "processors": text_options("Processor"),
-            "operating_systems": text_options("OperatingSystem"),
-            "min_price": float(catalog["_price_usd"].min()),
-            "max_price": float(catalog["_price_usd"].max()),
-                "inr_to_usd_rate": INR_TO_USD_RATE,
-                "exchange_rate_date": EXCHANGE_RATE_DATE,
+        "ram_gb": sorted(
+            float(value)
+            for value in available_phones["RAM"].map(parse_ram_gb).dropna().unique()
+            if value > 0
+        ),
+        "storage_gb": numeric_options("Storage_GB"),
+        "battery_mah": numeric_options("Battery_mAh"),
+        "display_size_inches": numeric_options(
+            "Display_Size_Inches", integer=False
+        ),
+        "refresh_rate_hz": numeric_options("Refresh_Rate_Hz"),
+        "camera_mp": numeric_options("Main_Camera_MP"),
+        "models": text_options("Model"),
+        "processors": text_options("Processor"),
+        "operating_systems": text_options("OperatingSystem"),
+        "specifications": text_options("Specification"),
+        "memories": text_options("Memory"),
+        "markets": text_options("Market"),
+        "ratings": numeric_options("Rating", integer=False, positive_only=False),
+        "has_fingerprint": sorted(
+            available_phones["Has_Fingerprint"].dropna().astype(str).unique()
+        ),
+        "has_face_unlock": sorted(
+            available_phones["Has_Face_Unlock"].dropna().astype(str).unique()
+        ),
+        "cameras": text_options("Camera"),
+        "prices": numeric_options("_price_usd", integer=False),
+        "min_price": float(available_phones["_price_usd"].min()),
+        "max_price": float(available_phones["_price_usd"].max()),
+        "inr_to_usd_rate": INR_TO_USD_RATE,
+        "exchange_rate_date": EXCHANGE_RATE_DATE,
     }
 
 
@@ -392,98 +506,538 @@ def search_phones(
     display_size_inches: Optional[float] = None,
     refresh_rate_hz: Optional[int] = None,
     camera_mp: Optional[int] = None,
-        model: Optional[str] = None,
-        processor: Optional[str] = None,
-        operating_system: Optional[str] = None,
-        offset: int = Query(default=0, ge=0),
-        limit: int = Query(default=60, ge=1, le=100),
+    rating: Optional[float] = None,
+    model: Optional[str] = None,
+    processor: Optional[str] = None,
+    operating_system: Optional[str] = None,
+    specification: Optional[str] = None,
+    memory: Optional[str] = None,
+    market: Optional[str] = None,
+    has_fingerprint: Optional[Literal["Yes", "No", "Not listed"]] = None,
+    has_face_unlock: Optional[Literal["Yes", "No", "Not listed"]] = None,
+    sort: Literal["model", "price_asc", "price_desc"] = "model",
+    offset: int = Query(default=0, ge=0),
+    limit: int = Query(default=60, ge=1, le=100),
 ):
-    matches = filter_phones(
-        min_price, max_price, ram_gb, storage_gb, battery_mah,
-        display_size_inches, refresh_rate_hz, camera_mp, model, processor,
-        operating_system,
-    )
-    total = len(matches)
-    page = matches.iloc[offset : offset + limit]
-    items = []
-    for _, phone in page.iterrows():
-        storage = phone["Internal_Storage"]
-        storage_gb = pd.to_numeric(phone["Storage_GB"], errors="coerce")
-        if pd.isna(storage) or str(storage).strip().lower() in {"", "unknown", "n/a"}:
-            storage = f"{int(storage_gb)} GB" if pd.notna(storage_gb) and storage_gb > 0 else "Not listed"
-        items.append(
-                {
-                        "model": phone["Model"],
-                        "phone_id": int(phone["Phone_ID"]),
-                        "touchscreen": True,
-                        "price_usd": float(phone["_price_usd"]),
-                        "rating": float(phone["Rating"]) if pd.notna(phone["Rating"]) else None,
-                        "processor": phone["Processor"],
-                        "ram": phone["RAM"],
-                        "ram_gb": int(phone["RAM_GB"]) if pd.notna(phone["RAM_GB"]) else None,
-                        "storage": storage,
-                        "storage_gb": int(phone["Storage_GB"])
-                        if pd.notna(phone["Storage_GB"])
-                        else None,
-                        "battery": phone["Battery"],
-                        "battery_mah": int(phone["Battery_mAh"])
-                        if pd.notna(phone["Battery_mAh"])
-                        else None,
-                        "display_size_inches": float(phone["Display_Size_Inches"])
-                        if pd.notna(phone["Display_Size_Inches"])
-                        else None,
-                        "refresh_rate_hz": int(phone["Refresh_Rate_Hz"])
-                        if pd.notna(phone["Refresh_Rate_Hz"])
-                        else None,
-                        "camera_mp": int(phone["Main_Camera_MP"])
-                        if pd.notna(phone["Main_Camera_MP"])
-                        else None,
-                        "display": phone["Display"],
-                        "camera": phone["Camera"],
-                        "memory": phone["Memory"],
-                        "operating_system": phone["OperatingSystem"],
-                        "specification": phone["Specification"],
-                        "has_fingerprint": phone["Has_Fingerprint"],
-                        "has_face_unlock": phone["Has_Face_Unlock"],
-                        "is_original": phone["Is_Original"],
-                        "image_search_url": phone["Image_Search_URL"],
-                        "video_search_url": phone["Video_Search_URL"],
-                        "gif_search_url": phone["GIF_Search_URL"],
-                }
-        )
+    preferences = {
+        key: value
+        for key, value in {
+            "min_price": min_price,
+            "max_price": max_price,
+            "ram_gb": ram_gb,
+            "storage_gb": storage_gb,
+            "battery_mah": battery_mah,
+            "display_size_inches": display_size_inches,
+            "refresh_rate_hz": refresh_rate_hz,
+            "camera_mp": camera_mp,
+            "rating": rating,
+            "model": model,
+            "processor": processor,
+            "operating_system": operating_system,
+            "specification": specification,
+            "memory": memory,
+            "market": market,
+            "has_fingerprint": has_fingerprint,
+            "has_face_unlock": has_face_unlock,
+        }.items()
+        if value is not None and value != ""
+    }
+    ranked = rank_phone_matches(preferences, sort)
+    total = len(ranked)
+    page = ranked.iloc[offset : offset + limit]
+    items = [
+        {
+            **phone_public_record(phone),
+            "exact_match": bool(phone["_exact_match"]),
+            "match_score": float(phone["_match_score"]),
+        }
+        for _, phone in page.iterrows()
+    ]
     return {"items": items, "total": total, "offset": offset, "limit": limit}
+
+
+def phone_public_record(phone):
+    storage = phone["Internal_Storage"]
+    storage_gb = pd.to_numeric(phone["Storage_GB"], errors="coerce")
+    if pd.isna(storage) or str(storage).strip().lower() in {"", "unknown", "n/a"}:
+        storage = (
+            f"{int(storage_gb)} GB"
+            if pd.notna(storage_gb) and storage_gb > 0
+            else "Not listed"
+        )
+    return {
+        "model": phone["Model"],
+        "phone_id": int(phone["Phone_ID"]),
+        "price_usd": float(phone["_price_usd"]),
+        "rating": float(phone["Rating"]) if pd.notna(phone["Rating"]) else None,
+        "processor": phone["Processor"],
+        "ram": phone["RAM"],
+        "ram_gb": int(parse_ram_gb(phone["RAM"]))
+        if pd.notna(parse_ram_gb(phone["RAM"]))
+        else None,
+        "storage": storage,
+        "storage_gb": int(phone["Storage_GB"])
+        if pd.notna(phone["Storage_GB"])
+        else None,
+        "battery_mah": int(phone["Battery_mAh"])
+        if pd.notna(phone["Battery_mAh"])
+        else None,
+        "display_size_inches": float(phone["Display_Size_Inches"])
+        if pd.notna(phone["Display_Size_Inches"])
+        else None,
+        "refresh_rate_hz": int(phone["Refresh_Rate_Hz"])
+        if pd.notna(phone["Refresh_Rate_Hz"])
+        else None,
+        "camera_mp": int(phone["Main_Camera_MP"])
+        if pd.notna(phone["Main_Camera_MP"])
+        else None,
+        "camera": phone["Camera"],
+        "memory": phone["Memory"],
+        "operating_system": phone["OperatingSystem"],
+        "specification": phone["Specification"],
+        "market": phone["Market"],
+        "has_fingerprint": phone["Has_Fingerprint"],
+        "has_face_unlock": phone["Has_Face_Unlock"],
+        "image_search_url": phone["Image_Search_URL"],
+        "video_search_url": phone["Video_Search_URL"],
+        "gif_search_url": phone["GIF_Search_URL"],
+    }
+
+
+def rank_phone_matches(preferences, sort="model"):
+    numeric_columns = {
+        "min_price": "_price_usd",
+        "max_price": "_price_usd",
+        "ram_gb": "RAM",
+        "storage_gb": "Storage_GB",
+        "battery_mah": "Battery_mAh",
+        "display_size_inches": "Display_Size_Inches",
+        "refresh_rate_hz": "Refresh_Rate_Hz",
+        "camera_mp": "Main_Camera_MP",
+        "rating": "Rating",
+    }
+    text_columns = {
+        "model": "Model",
+        "processor": "Processor",
+        "operating_system": "OperatingSystem",
+        "specification": "Specification",
+        "memory": "Memory",
+        "market": "Market",
+    }
+    sensor_columns = {
+        "has_fingerprint": "Has_Fingerprint",
+        "has_face_unlock": "Has_Face_Unlock",
+    }
+    scored = []
+    reference = pd.concat([df, training_df], ignore_index=True, sort=False)
+
+    def numeric_value(frame, preference, column):
+        if preference == "ram_gb":
+            if isinstance(frame, pd.Series):
+                return parse_ram_gb(frame[column])
+            return frame[column].map(parse_ram_gb)
+        return pd.to_numeric(frame[column], errors="coerce")
+
+    for _, phone in df.iterrows():
+        scores = []
+        exact = bool(preferences)
+        for preference, column in numeric_columns.items():
+            target = preferences.get(preference)
+            if target is None:
+                continue
+            value = (
+                float(phone["_price_usd"])
+                if column == "_price_usd"
+                else numeric_value(phone, preference, column)
+            )
+            target = float(target)
+            if preference == "max_price":
+                difference = max(0.0, value - target)
+            elif preference == "min_price":
+                difference = max(0.0, target - value)
+            else:
+                difference = abs(float(value) - target) if pd.notna(value) else float("inf")
+                exact = exact and difference < 1e-8
+            if preference in {"min_price", "max_price"}:
+                exact = exact and difference == 0
+
+            reference_values = numeric_value(reference, preference, column).dropna()
+            feature_range = (
+                float(reference_values.max() - reference_values.min())
+                if not reference_values.empty
+                else 0.0
+            )
+            scale = max(feature_range * 0.25, abs(target) * 0.1, 1.0)
+            scores.append(max(0.0, 1.0 - difference / scale))
+
+        for preference, column in text_columns.items():
+            target = preferences.get(preference)
+            if target is None:
+                continue
+            target_text = str(target).strip().casefold()
+            value = "" if pd.isna(phone[column]) else str(phone[column]).strip()
+            normalized_value = value.casefold()
+            if target_text == normalized_value:
+                score = 1.0
+            elif target_text in normalized_value or normalized_value in target_text:
+                score = 0.85
+            else:
+                score = SequenceMatcher(None, target_text, normalized_value).ratio()
+            exact = exact and score == 1.0
+            scores.append(score)
+
+        for preference, column in sensor_columns.items():
+            target = preferences.get(preference)
+            if target is None:
+                continue
+            score = 1.0 if str(phone[column]).casefold() == str(target).casefold() else 0.0
+            exact = exact and score == 1.0
+            scores.append(score)
+
+        scored.append(
+            {
+                **phone.to_dict(),
+                "_exact_match": exact,
+                "_match_score": round(sum(scores) / len(scores) * 100, 1)
+                if scores
+                else 100.0,
+            }
+        )
+
+    ranked = pd.DataFrame(scored)
+    if not preferences and sort == "price_asc":
+        return ranked.sort_values(["_price_usd", "Model"], ascending=[True, True], kind="stable")
+    if not preferences and sort == "price_desc":
+        return ranked.sort_values(["_price_usd", "Model"], ascending=[False, True], kind="stable")
+    if not preferences:
+        return ranked.sort_values(
+            "Model",
+            key=lambda values: values.astype(str).str.casefold(),
+            kind="stable",
+        )
+    return ranked.sort_values(
+        ["_exact_match", "_match_score", "_price_usd", "Model"],
+        ascending=[False, False, sort != "price_desc", True],
+        key=lambda values: values.astype(str).str.casefold()
+        if values.name == "Model"
+        else values,
+        kind="stable",
+    )
+
+
+@app.post("/phones/recommendations")
+def recommend_phones(preferences: PhoneRecommendationInput):
+    preference_data = preferences.model_dump()
+    preference_values = {
+        key: value
+        for key, value in preference_data.items()
+        if key not in {"offset", "limit"} and value is not None
+    }
+    if not preference_values and preferences.max_price is None:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide at least one budget or phone preference.",
+        )
+
+    candidates = df
+    if preferences.max_price is not None:
+        candidates = candidates[candidates["_price_usd"] <= preferences.max_price]
+    if preferences.model:
+        candidates = candidates[
+            candidates["Model"].map(
+                lambda candidate: fuzzy_text_match(candidate, preferences.model)
+            )
+        ]
+
+    scored_items = []
+    for _, phone in candidates.iterrows():
+        input_data = build_model_features(phone)
+        for preference, column in (
+            ("has_fingerprint", "Has_Fingerprint"),
+            ("has_face_unlock", "Has_Face_Unlock"),
+        ):
+            selected_value = preference_data.get(preference)
+            if selected_value is not None:
+                input_data.loc[:, column] = selected_value
+        probabilities = model.predict_proba(input_data)[0]
+        recommended_probability = float(
+            probabilities[list(model.classes_).index("Recommended")] * 100
+        )
+        prediction = str(model.classes_[int(probabilities.argmax())])
+        match_score = calculate_preference_match(phone, preference_values)
+        recommended = prediction == "Recommended" and (
+            not preference_values or match_score >= 50
+        )
+        recommendation_reason = explain_recommendation(
+            phone, preference_values, recommended
+        )
+        recommendation_score = round(
+            match_score * 0.35 + recommended_probability * 0.65, 1
+        )
+        scored_items.append(
+            {
+                **phone_public_record(phone),
+                "recommended": recommended,
+                "recommendation_reason": recommendation_reason,
+                "recommendation_score": recommendation_score,
+                "match_score": match_score,
+                "predicted_label": prediction,
+                "confidence": round(float(probabilities.max() * 100), 2),
+                "recommendation_probability": round(recommended_probability, 2),
+            }
+        )
+
+    scored_items.sort(
+        key=lambda item: (
+            not item["recommended"],
+            -item["recommendation_score"],
+            -item["match_score"],
+            item["price_usd"],
+            item["model"].casefold(),
+        )
+    )
+    total = len(scored_items)
+    page = scored_items[preferences.offset : preferences.offset + preferences.limit]
+    return {
+        "items": page,
+        "total": total,
+        "offset": preferences.offset,
+        "limit": preferences.limit,
+    }
+
+
+@app.post("/phones/{phone_id}/recommendation")
+def recommend_phone(phone_id: int, preferences: PhoneRecommendationInput):
+    phone_rows = df[df["Phone_ID"].astype(str) == str(phone_id)]
+    if phone_rows.empty:
+        raise HTTPException(status_code=404, detail="Phone not found.")
+
+    phone = phone_rows.iloc[0]
+    preference_values = {
+        key: value
+        for key, value in preferences.model_dump().items()
+        if key not in {"offset", "limit"} and value is not None
+    }
+    probabilities = model.predict_proba(build_model_features(phone))[0]
+    recommended_probability = float(
+        probabilities[list(model.classes_).index("Recommended")] * 100
+    )
+    prediction = str(model.classes_[int(probabilities.argmax())])
+    match_score = calculate_preference_match(phone, preference_values)
+    recommended = prediction == "Recommended" and (
+        not preference_values or match_score >= 50
+    )
+    return {
+        **phone_public_record(phone),
+        "recommended": recommended,
+        "label": "Recommended" if recommended else "Not Recommended",
+        "recommendation_reason": explain_recommendation(
+            phone, preference_values, recommended
+        ),
+        "recommendation_score": round(
+            match_score * 0.35 + recommended_probability * 0.65, 1
+        ),
+        "match_score": match_score,
+        "predicted_label": prediction,
+        "confidence": round(float(probabilities.max() * 100), 2),
+        "recommendation_probability": round(recommended_probability, 2),
+    }
+
+
+def explain_recommendation(phone, preferences, recommended):
+    reference = pd.concat([df, training_df], ignore_index=True, sort=False)
+
+    def percentile(column, value, parser=None):
+        values = (
+            reference[column].map(parser)
+            if parser is not None
+            else pd.to_numeric(reference[column], errors="coerce")
+        ).dropna()
+        if values.empty or pd.isna(value):
+            return 0.5
+        return float((values <= value).mean())
+
+    price = float(phone["_price_usd"])
+    ram = parse_ram_gb(phone["RAM"])
+    storage = pd.to_numeric(phone["Storage_GB"], errors="coerce")
+    battery = pd.to_numeric(phone["Battery_mAh"], errors="coerce")
+    rating = pd.to_numeric(phone["Rating"], errors="coerce")
+    display = pd.to_numeric(phone["Display_Size_Inches"], errors="coerce")
+    price_rank = percentile("_price_usd", price)
+    ram_rank = percentile("RAM", ram, parse_ram_gb)
+    storage_rank = percentile("Storage_GB", storage)
+    battery_rank = percentile("Battery_mAh", battery)
+    rating_rank = percentile("Rating", rating)
+
+    budget = preferences.get("max_price")
+    over_budget = budget is not None and price > float(budget)
+    low_hardware = []
+    high_hardware = []
+    for rank, label in (
+        (ram_rank, "RAM"),
+        (storage_rank, "storage"),
+        (battery_rank, "battery capacity"),
+        (rating_rank, "rating"),
+    ):
+        if rank <= 0.25:
+            low_hardware.append(label)
+        elif rank >= 0.75:
+            high_hardware.append(label)
+
+    if recommended:
+        reasons = []
+        if budget is not None and not over_budget:
+            reasons.append(f"its ${price:,.2f} price is within your ${float(budget):,.2f} budget")
+        reasons.extend(f"high {label}" for label in high_hardware[:2])
+        if pd.notna(display) and 6.0 <= float(display) <= 6.9:
+            reasons.append(f"an optimal {float(display):g}-inch display size")
+        if not reasons:
+            reasons.append(
+                "its balanced price, rating, and hardware value compared with the training catalog"
+            )
+        return "Recommended due to " + " and ".join(reasons) + "."
+
+    if over_budget and price_rank >= 0.75 and low_hardware:
+        hardware = " and ".join(f"low {label}" for label in low_hardware[:2])
+        return f"Not Recommended due to high price relative to {hardware}."
+    reasons = []
+    if over_budget:
+        reasons.append(f"its ${price:,.2f} price exceeds your ${float(budget):,.2f} budget")
+    reasons.extend(f"low {label}" for label in low_hardware[:2])
+    if not reasons and price_rank >= 0.75:
+        reasons.append("its high price relative to its rating and hardware")
+    if not reasons:
+        reasons.append(
+            "its overall price, rating, and hardware profile falls below the training-catalog value threshold"
+        )
+    return "Not Recommended due to " + " and ".join(reasons) + "."
+
+
+def calculate_preference_match(phone, preferences):
+    numeric_preferences = {
+        "ram_gb": "RAM",
+        "storage_gb": "Storage_GB",
+        "battery_mah": "Battery_mAh",
+        "display_size_inches": "Display_Size_Inches",
+        "refresh_rate_hz": "Refresh_Rate_Hz",
+        "camera_mp": "Main_Camera_MP",
+        "rating": "Rating",
+        "max_price": "_price_usd",
+    }
+    text_preferences = {
+        "model": "Model",
+        "processor": "Processor",
+        "operating_system": "OperatingSystem",
+        "specification": "Specification",
+        "memory": "Memory",
+        "market": "Market",
+    }
+    scores = []
+    for preference, column in numeric_preferences.items():
+        target = preferences.get(preference)
+        value = (
+            parse_ram_gb(phone[column])
+            if column == "RAM"
+            else float(phone[column])
+            if column == "_price_usd"
+            else pd.to_numeric(phone[column], errors="coerce")
+        )
+        if target is None or pd.isna(value):
+            continue
+        if preference == "max_price":
+            scores.append(1.0 if float(value) <= float(target) else 0.0)
+            continue
+        catalog_values = (
+            pd.concat([df[column], training_df[column]], ignore_index=True)
+            .map(parse_ram_gb)
+            .dropna()
+            if column == "RAM"
+            else pd.to_numeric(
+                pd.concat([df[column], training_df[column]], ignore_index=True),
+                errors="coerce",
+            ).dropna()
+        )
+        feature_range = float(catalog_values.max() - catalog_values.min())
+        scale = max(feature_range * 0.25, abs(float(target)) * 0.1, 1)
+        scores.append(max(0, 1 - abs(float(value) - float(target)) / scale))
+    for preference, column in text_preferences.items():
+        target = str(preferences.get(preference, "")).strip().casefold()
+        value = str(phone[column]).strip().casefold()
+        if not target:
+            continue
+        scores.append(
+            1.0
+            if target in value or value in target
+            else SequenceMatcher(None, target, value).ratio()
+        )
+    for preference, column in (
+        ("has_fingerprint", "Has_Fingerprint"),
+        ("has_face_unlock", "Has_Face_Unlock"),
+    ):
+        target = preferences.get(preference)
+        if target is not None:
+            scores.append(
+                1.0
+                if str(phone[column]).strip().casefold()
+                == str(target).strip().casefold()
+                else 0.0
+            )
+    return round(sum(scores) / len(scores) * 100, 1) if scores else 100.0
 
 
 def filter_phones(
     min_price, max_price, ram_gb, storage_gb, battery_mah,
     display_size_inches, refresh_rate_hz, camera_mp, model, processor,
-    operating_system,
+    operating_system, sort="model",
 ):
-    matches = get_touchscreen_phones()
+    matches = df
     if min_price is not None:
         matches = matches[matches["_price_usd"] >= min_price]
     if max_price is not None:
         matches = matches[matches["_price_usd"] <= max_price]
+    if ram_gb is not None:
+        matches = matches[
+            matches["RAM"].map(parse_ram_gb).eq(ram_gb)
+        ]
     for column, value in (
-            ("RAM_GB", ram_gb),
-            ("Storage_GB", storage_gb),
-            ("Battery_mAh", battery_mah),
-            ("Display_Size_Inches", display_size_inches),
-            ("Refresh_Rate_Hz", refresh_rate_hz),
-            ("Main_Camera_MP", camera_mp),
+        ("Storage_GB", storage_gb),
+        ("Battery_mAh", battery_mah),
+        ("Display_Size_Inches", display_size_inches),
+        ("Refresh_Rate_Hz", refresh_rate_hz),
+        ("Main_Camera_MP", camera_mp),
     ):
         if value is not None:
             matches = matches[pd.to_numeric(matches[column], errors="coerce") == value]
     for column, value in (
-            ("Model", model),
-            ("Processor", processor),
-            ("OperatingSystem", operating_system),
+        ("Model", model),
+        ("Processor", processor),
+        ("OperatingSystem", operating_system),
     ):
         if value:
             matches = matches[
-                    matches[column].astype(str).str.contains(re.escape(value), case=False, na=False)
+                matches[column].astype(str).map(
+                    lambda candidate: fuzzy_text_match(candidate, value)
+                )
             ]
 
+    if sort == "price_asc":
+        return matches.sort_values(
+            ["_price_usd", "Model"],
+            ascending=[True, True],
+            key=lambda values: values.astype(str).str.casefold()
+            if values.name == "Model"
+            else values,
+            kind="stable",
+        )
+    if sort == "price_desc":
+        return matches.sort_values(
+            ["_price_usd", "Model"],
+            ascending=[False, True],
+            key=lambda values: values.astype(str).str.casefold()
+            if values.name == "Model"
+            else values,
+            kind="stable",
+        )
     return matches.sort_values(
         "Model",
         key=lambda values: values.astype(str).str.casefold(),
@@ -491,11 +1045,31 @@ def filter_phones(
     )
 
 
-def get_touchscreen_phones():
-    touchscreen = df["Touchscreen"].astype(str).str.strip().str.lower().isin(
-        {"true", "yes", "1"}
-    )
-    return df[touchscreen]
+def fuzzy_text_match(candidate, query):
+    normalized_candidate = unicodedata.normalize("NFKD", str(candidate)).encode(
+        "ascii", "ignore"
+    ).decode("ascii").casefold()
+    normalized_query = unicodedata.normalize("NFKD", str(query)).encode(
+        "ascii", "ignore"
+    ).decode("ascii").casefold()
+    candidate_tokens = re.findall(r"[a-z0-9]+", normalized_candidate)
+    query_tokens = re.findall(r"[a-z0-9]+", normalized_query)
+    if not query_tokens:
+        return True
+    if " ".join(query_tokens) in " ".join(candidate_tokens):
+        return True
+    for query_token in query_tokens:
+        if len(query_token) < 3:
+            if query_token not in candidate_tokens:
+                return False
+            continue
+        if not any(
+            SequenceMatcher(None, query_token, candidate_token).ratio()
+            >= TEXT_SEARCH_THRESHOLD
+            for candidate_token in candidate_tokens
+        ):
+            return False
+    return True
 
 
 def pdf_text(value):
@@ -512,12 +1086,15 @@ def build_phone_pdf(phones):
     hardware_columns = {
         "Processor",
         "OperatingSystem",
-        "RAM_GB",
+        "RAM",
         "Storage_GB",
         "Battery_mAh",
         "Display_Size_Inches",
         "Refresh_Rate_Hz",
         "Main_Camera_MP",
+    }
+    internal_columns = {
+        LABEL_COLUMN,
     }
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -531,13 +1108,14 @@ def build_phone_pdf(phones):
     for _, phone in phones.iterrows():
         section_rows = []
         for column in phones.columns:
-            if column.startswith("_") or column in excluded_columns or column in {"Model", "Price_USD"}:
-                continue
-            value = phone[column]
-            if column == "Date_Added" and (
-                pd.isna(value) or not str(value).strip()
+            if (
+                column.startswith("_")
+                or column in excluded_columns
+                or column in internal_columns
+                or column in {"Model", "Price_USD"}
             ):
                 continue
+            value = phone[column]
             if phones[column].isna().all() or phones[column].astype(str).str.strip().eq("").all():
                 continue
             value = "Not listed" if pd.isna(value) or not str(value).strip() else str(value)
@@ -545,35 +1123,38 @@ def build_phone_pdf(phones):
                 "Hardware"
                 if column in hardware_columns
                 else "Catalog details"
-                if column in {"Phone_ID", "Date_Added", "Rating", "IsOriginal"}
+                if column in {"Phone_ID", "Rating", "Market"}
                 else "Features and media"
             )
             wrapped_value = textwrap.wrap(
-                value, width=68, break_long_words=True, break_on_hyphens=True
+                value, width=64, break_long_words=True, break_on_hyphens=True
             ) or [""]
             section_rows.append(
-                (section, column.replace("_", " "), wrapped_value, max(17, 8 * len(wrapped_value) + 6))
+                (section, column.replace("_", " "), wrapped_value, 14 + 9 * len(wrapped_value))
             )
         section_order = {"Catalog details": 0, "Hardware": 1, "Features and media": 2}
         section_rows.sort(key=lambda row: (section_order[row[0]], row[1].casefold()))
         pages = []
         page_rows = []
-        page_height = 0
+        y_position = 710
         current_section = None
         for section, label, wrapped_value, row_height in section_rows:
             section_height = 17 if section != current_section else 0
-            if page_rows and page_height + section_height + row_height > 620:
+            if page_rows and y_position - section_height - row_height < 82:
                 pages.append(page_rows)
                 page_rows = []
-                page_height = 0
+                y_position = 710
                 current_section = None
                 section_height = 17
             page_rows.append((section, label, wrapped_value, row_height))
-            page_height += section_height + row_height
+            y_position -= section_height + row_height
             current_section = section
         if page_rows or not pages:
             pages.append(page_rows)
-        price_value = pd.to_numeric(phone.get("Price_USD"), errors="coerce")
+        price_value = pd.to_numeric(
+            phone.get("_price_usd", phone.get("Price_USD")),
+            errors="coerce",
+        )
         price_label = f"${price_value:,.2f}" if pd.notna(price_value) else "Price not listed"
         phone_pages.extend(
             (phone["Model"], price_label, page_rows, page_index > 0)
@@ -608,14 +1189,14 @@ def build_phone_pdf(phones):
         for section, label, wrapped_value, row_height in page_rows:
             if section != current_section:
                 commands.append(f"BT /F2 9 Tf 48 {y_position} Td ({pdf_text(section.upper())}) Tj ET")
-                y_position -= 16
+                y_position -= 17
                 current_section = section
             fill = "0.91 0.95 0.92" if int(y_position) % 2 else "1 1 1"
             commands.append(f"q {fill} rg 44 {y_position - row_height + 5} 507 {row_height} re f Q")
             commands.append(f"BT /F2 7.5 Tf 53 {y_position - 8} Td ({pdf_text(label[:27])}) Tj ET")
             for line_index, line in enumerate(wrapped_value):
                 commands.append(
-                    f"BT /F1 7.5 Tf 190 {y_position - 8 - line_index * 8} Td ({pdf_text(line)}) Tj ET"
+                    f"BT /F1 7.5 Tf 190 {y_position - 8 - line_index * 9} Td ({pdf_text(line)}) Tj ET"
                 )
             y_position -= row_height
         commands.extend(
@@ -669,11 +1250,39 @@ def export_phone_pdf(
     model: Optional[str] = None,
     processor: Optional[str] = None,
     operating_system: Optional[str] = None,
+    rating: Optional[float] = None,
+    specification: Optional[str] = None,
+    memory: Optional[str] = None,
+    market: Optional[str] = None,
+    has_fingerprint: Optional[Literal["Yes", "No", "Not listed"]] = None,
+    has_face_unlock: Optional[Literal["Yes", "No", "Not listed"]] = None,
+    sort: Literal["model", "price_asc", "price_desc"] = "model",
 ):
-    phones = filter_phones(
-        min_price, max_price, ram_gb, storage_gb, battery_mah,
-        display_size_inches, refresh_rate_hz, camera_mp, model, processor,
-        operating_system,
+    phones = rank_phone_matches(
+        {
+            key: value
+            for key, value in {
+                "min_price": min_price,
+                "max_price": max_price,
+                "ram_gb": ram_gb,
+                "storage_gb": storage_gb,
+                "battery_mah": battery_mah,
+                "display_size_inches": display_size_inches,
+                "refresh_rate_hz": refresh_rate_hz,
+                "camera_mp": camera_mp,
+                "model": model,
+                "processor": processor,
+                "operating_system": operating_system,
+                "rating": rating,
+                "specification": specification,
+                "memory": memory,
+                "market": market,
+                "has_fingerprint": has_fingerprint,
+                "has_face_unlock": has_face_unlock,
+            }.items()
+            if value is not None
+        },
+        sort,
     )
     return Response(
         content=build_phone_pdf(phones),
@@ -684,7 +1293,7 @@ def export_phone_pdf(
 
 @app.get("/phones/{phone_id}/pdf")
 def export_single_phone_pdf(phone_id: int):
-    phone = get_touchscreen_phones()
+    phone = df
     phone = phone[phone["Phone_ID"].astype(str) == str(phone_id)]
     if phone.empty:
         raise HTTPException(status_code=404, detail="Phone not found.")
@@ -702,19 +1311,7 @@ def record_phone_search_interest(data: PhoneSearchInterest):
     filters = data.model_dump()
     if not any(value is not None and value != "" for value in filters.values()):
         return {"recorded": 0}
-    matches = filter_phones(
-        filters["min_price"],
-        filters["max_price"],
-        filters["ram_gb"],
-        filters["storage_gb"],
-        filters["battery_mah"],
-        filters["display_size_inches"],
-        filters["refresh_rate_hz"],
-        filters["camera_mp"],
-        filters["model"],
-        filters["processor"],
-        filters["operating_system"],
-    )
+    matches = rank_phone_matches(filters).head(24)
     with get_popularity_connection() as connection:
         connection.executemany(
             """
@@ -743,7 +1340,7 @@ def get_popular_phones(limit: int = Query(default=6, ge=1, le=20)):
     if not popularity:
         return {"items": []}
     popular_by_id = {int(row[0]): int(row[1]) for row in popularity}
-    phones = get_touchscreen_phones()
+    phones = df
     phones = phones[phones["Phone_ID"].astype(int).isin(popular_by_id)]
     phones = phones.assign(
         _search_count=phones["Phone_ID"].astype(int).map(popular_by_id)
@@ -823,20 +1420,13 @@ def admin_logout(_: None = Depends(require_admin), x_admin_token: Optional[str] 
 @app.get("/admin/phones")
 def list_admin_phones(_: None = Depends(require_admin)):
     phones = df.assign(
-        _model_sort=df["Model"].astype(str).str.casefold(),
-        _date_sort=pd.to_datetime(df["Date_Added"], errors="coerce"),
-    ).sort_values(
-        ["_date_sort", "_model_sort"],
-        ascending=[False, True],
-        na_position="last",
-        kind="stable",
-    )
+        _model_sort=df["Model"].astype(str).str.casefold()
+    ).sort_values("_model_sort", kind="stable")
     return {
         "items": [
             {
                 "phone_id": int(phone["Phone_ID"]),
                 "model": phone["Model"],
-                "date_added": "" if pd.isna(phone["Date_Added"]) else str(phone["Date_Added"]),
             }
             for _, phone in phones.iterrows()
         ]
@@ -851,17 +1441,38 @@ def get_admin_phone(phone_id: int, _: None = Depends(require_admin)):
     return admin_phone_record(matches.iloc[0])
 
 
+def ensure_catalog_model_is_independent(model_name, excluded_phone_id=None):
+    normalized_name = normalized_model_name(model_name)
+    if normalized_name in set(training_df["Model"].map(normalized_model_name)):
+        raise HTTPException(
+            status_code=409,
+            detail="This model belongs to the training dataset and cannot be added to the catalog.",
+        )
+    existing = df
+    if excluded_phone_id is not None:
+        existing = existing[existing["Phone_ID"].astype(str) != str(excluded_phone_id)]
+    if normalized_name in set(existing["Model"].map(normalized_model_name)):
+        raise HTTPException(
+            status_code=409,
+            detail="A phone with this model name already exists in the catalog.",
+        )
+
+
 @app.post("/admin/phones", status_code=201)
 def create_admin_phone(
     data: AdminPhoneInput,
     _: None = Depends(require_admin),
 ):
+    ensure_catalog_model_is_independent(data.model)
     phone_id = int(pd.to_numeric(df["Phone_ID"], errors="coerce").max()) + 1
     row = {column: "" for column in df.columns if not column.startswith("_")}
     row = apply_admin_phone(row, data.model_dump(), phone_id)
+    row[LABEL_COLUMN] = recommendation_labels(
+        training_df, pd.DataFrame([row])
+    )[0]
     updated_df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     save_admin_dataset(updated_df)
-    return admin_phone_record(df.iloc[-1])
+    return admin_phone_record(df[df["Phone_ID"].astype(str) == str(phone_id)].iloc[0])
 
 
 @app.put("/admin/phones/{phone_id}")
@@ -876,7 +1487,21 @@ def update_admin_phone(
     updated_df = df.copy()
     index = matches[0]
     original = updated_df.loc[index].drop(labels=["_price_inr", "_price_usd"], errors="ignore").to_dict()
-    updated_df.loc[index] = apply_admin_phone(original, data.model_dump(), phone_id)
+    values = data.model_dump()
+    ensure_catalog_model_is_independent(data.model, phone_id)
+    updated_row = apply_admin_phone(original, values, phone_id)
+    updated_row[LABEL_COLUMN] = recommendation_labels(
+        training_df, pd.DataFrame([updated_row])
+    )[0]
+    for column in ("_price_inr", "_price_usd"):
+        if column in updated_df.columns:
+            updated_row[column] = updated_df.at[index, column]
+    updated_df = pd.concat(
+        [
+            updated_df.drop(index=index),
+            pd.DataFrame([updated_row], index=[index]),
+        ]
+    ).sort_index()
     save_admin_dataset(updated_df)
     return admin_phone_record(df.loc[index])
 
@@ -888,31 +1513,6 @@ def delete_admin_phone(phone_id: int, _: None = Depends(require_admin)):
         raise HTTPException(status_code=404, detail="Phone not found.")
     save_admin_dataset(updated_df.reset_index(drop=True))
     return {"deleted": phone_id}
-
-
-@app.post("/predict")
-def predict_authenticity(data: SmartphoneInput):
-  input_data = [[
-      data.ram_gb,
-      data.storage_gb,
-      data.battery_mah,
-      data.display_size_inches,
-      data.refresh_rate_hz,
-      data.main_camera_mp,
-  ]]
-
-  prediction = model.predict(input_data)[0]
-  probability = max(model.predict_proba(input_data)[0]) * 100
-
-  return {
-      "prediction": prediction,
-      "confidence": round(probability, 2),
-      "message": (
-          f"ስልኩ {prediction} መሆኑ ተረጋግጧል!"
-          if prediction == "Original"
-          else "ማስጠንቀቂያ፡ ይህ ስልክ ሐሰተኛ (Fake/Replica) ሊሆን ይችላል!"
-      ),
-  }
 
 
 @app.get("/")
