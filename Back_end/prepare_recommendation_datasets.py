@@ -1,211 +1,155 @@
-import re
 from pathlib import Path
-from urllib.parse import urlparse
 
 import pandas as pd
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import train_test_split
 
 if __package__:
     from .recommendation_model import (
-        CATALOG_COLUMNS,
-        LABEL_COLUMN,
-        normalized_model_group,
-        recommendation_labels,
+        LINK_COLUMNS,
+        MODEL_FEATURE_COLUMNS,
+        SERIES_TIER_CODES,
+        SOURCE_LABEL_COLUMN,
     )
 else:
     from recommendation_model import (
-        CATALOG_COLUMNS,
-        LABEL_COLUMN,
-        normalized_model_group,
-        recommendation_labels,
+        LINK_COLUMNS,
+        MODEL_FEATURE_COLUMNS,
+        SERIES_TIER_CODES,
+        SOURCE_LABEL_COLUMN,
     )
 
 
 BACKEND_DIR = Path(__file__).resolve().parent
-SOURCE_PATH = BACKEND_DIR / "Smartphone_2024_enhanced_4.csv"
-CATALOG_PATH = BACKEND_DIR / "Phone_Recommendation_Catalog_Verified.csv"
-TRAINING_PATH = BACKEND_DIR / "Smartphone_Recommendation_Training_Verified.csv"
-SENSOR_ATTRIBUTES_PATH = BACKEND_DIR / "Phone_Sensor_Verified_Attributes.csv"
-SENSOR_COLUMNS = ("Has_Fingerprint", "Has_Face_Unlock")
-SENSOR_SOURCE_COLUMNS = {
-    "Has_Fingerprint": "Fingerprint_Source_URL",
-    "Has_Face_Unlock": "Face_Unlock_Source_URL",
+SOURCE_PATH = BACKEND_DIR / "Smartphone_Full_Dataset.csv"
+CATALOG_PATH = BACKEND_DIR / "SmartphoneDataset_Catalog_Clean.csv"
+TRAINING_PATH = BACKEND_DIR / "SmartphoneDataset_Training_Clean.csv"
+TEST_PATH = BACKEND_DIR / "SmartphoneDataset_Test.csv"
+ID_COLUMN = "Phone_ID"
+NUMERIC_FEATURES = {
+    "Series_Tier_Code",
+    "Price_USD",
+    "Rating",
+    "RAM_GB",
+    "Storage_GB",
+    "Battery_mAh",
+    "Display_Size_Inches",
+    "Refresh_Rate_Hz",
+    "Main_Camera_MP",
+    "Has_Fingerprint",
+    "Has_Face_Unlock",
 }
+DATASET_COLUMNS = (
+    ID_COLUMN,
+    *MODEL_FEATURE_COLUMNS,
+    SOURCE_LABEL_COLUMN,
+    *LINK_COLUMNS,
+)
+
+
+def clean_source():
+    source = pd.read_csv(SOURCE_PATH)
+    missing_columns = set(DATASET_COLUMNS).difference(source.columns)
+    if missing_columns:
+        raise ValueError(
+            f"Smartphone dataset is missing columns: {sorted(missing_columns)}"
+        )
+    unexpected_columns = set(source.columns).difference(DATASET_COLUMNS)
+    if unexpected_columns:
+        raise ValueError(
+            f"Smartphone dataset contains unexpected columns: "
+            f"{sorted(unexpected_columns)}"
+        )
+    source = source.loc[:, DATASET_COLUMNS].copy()
+
+    source[ID_COLUMN] = pd.to_numeric(source[ID_COLUMN], errors="coerce")
+    if (
+        source[ID_COLUMN].isna().any()
+        or source[ID_COLUMN].duplicated().any()
+        or not source[ID_COLUMN].mod(1).eq(0).all()
+    ):
+        raise ValueError("Phone_ID values must be unique integers.")
+    source[ID_COLUMN] = source[ID_COLUMN].astype(int)
+
+    for column in NUMERIC_FEATURES | {SOURCE_LABEL_COLUMN}:
+        source[column] = pd.to_numeric(source[column], errors="coerce")
+        if source[column].isna().any():
+            raise ValueError(f"{column} contains missing or invalid values.")
+    for column in ("Has_Fingerprint", "Has_Face_Unlock", SOURCE_LABEL_COLUMN):
+        if not set(source[column].unique()).issubset({0, 1}):
+            raise ValueError(f"{column} values must be binary 0/1.")
+    source["Series_Tier_Code"] = pd.to_numeric(
+        source["Series_Tier_Code"], errors="coerce"
+    )
+    expected_tier_codes = source["Series_Tier"].map(SERIES_TIER_CODES)
+    if source["Series_Tier_Code"].isna().any() or not source[
+        "Series_Tier_Code"
+    ].eq(expected_tier_codes).all():
+        raise ValueError("Series_Tier_Code does not match Series_Tier.")
+    for column in set(MODEL_FEATURE_COLUMNS).difference(NUMERIC_FEATURES):
+        source[column] = source[column].fillna("").astype(str).str.strip()
+        if source[column].eq("").any():
+            raise ValueError(f"{column} contains missing or blank values.")
+    for column in LINK_COLUMNS:
+        source[column] = source[column].fillna("").astype(str).str.strip()
+    if source.duplicated().any():
+        raise ValueError("Smartphone dataset contains duplicate rows.")
+    return source
+
+
+def split_training_test(source):
+    training, test = train_test_split(
+        source,
+        test_size=int(len(source) * 0.2),
+        random_state=42,
+        stratify=source[SOURCE_LABEL_COLUMN],
+    )
+    training = training.sort_values(ID_COLUMN, kind="stable")
+    test = test.sort_values(ID_COLUMN, kind="stable")
+    if len(training) + len(test) != len(source):
+        raise ValueError("The training/test split does not include every source row.")
+    if set(training[ID_COLUMN]) & set(test[ID_COLUMN]):
+        raise ValueError("Phone IDs overlap between training and test datasets.")
+    return training, test
+
+
+def write_datasets(training, test, catalog):
+    output_frames = (
+        (TRAINING_PATH, training),
+        (TEST_PATH, test),
+        (CATALOG_PATH, catalog),
+    )
+    temporary_paths = []
+    for dataset_path, frame in output_frames:
+        if dataset_path.exists():
+            try:
+                with dataset_path.open("r+b"):
+                    pass
+            except OSError as error:
+                raise PermissionError(
+                    f"Cannot update {dataset_path}; close applications using "
+                    "the dataset and try again."
+                ) from error
+        temporary_path = dataset_path.with_suffix(".tmp")
+        frame.to_csv(temporary_path, index=False, encoding="utf-8-sig")
+        temporary_paths.append((temporary_path, dataset_path))
+    for temporary_path, dataset_path in temporary_paths:
+        temporary_path.replace(dataset_path)
 
 
 def prepare_datasets():
-    source = pd.read_csv(SOURCE_PATH)
-    required = set(CATALOG_COLUMNS)
-    missing = required.difference(source.columns)
-    if missing:
-        raise ValueError(f"Source catalog is missing required columns: {sorted(missing)}")
-    verified_sensors = pd.read_csv(SENSOR_ATTRIBUTES_PATH).fillna("")
-    required_sensor_columns = {
-        "Model_Pattern",
-        "Manufacturer_Domain",
-        *SENSOR_COLUMNS,
-        *SENSOR_SOURCE_COLUMNS.values(),
-    }
-    missing_sensor_columns = required_sensor_columns.difference(
-        verified_sensors.columns
-    )
-    if missing_sensor_columns:
-        raise ValueError(
-            "Verified sensor data is missing columns: "
-            f"{sorted(missing_sensor_columns)}"
-        )
-    if verified_sensors["Model_Pattern"].duplicated().any():
-        raise ValueError("Verified sensor data contains duplicate model patterns.")
-    for _, sensor_record in verified_sensors.iterrows():
-        for column, source_column in SENSOR_SOURCE_COLUMNS.items():
-            value = str(sensor_record[column]).strip()
-            source_url = str(sensor_record[source_column]).strip()
-            manufacturer_domain = str(
-                sensor_record["Manufacturer_Domain"]
-            ).strip().casefold()
-            if value not in {"Yes", "No", "Not listed"}:
-                raise ValueError(
-                    f"Invalid {column} value for "
-                    f"{sensor_record['Model_Pattern']}: {value!r}"
-                )
-            if value in {"Yes", "No"}:
-                parsed_url = urlparse(source_url)
-                source_host = (parsed_url.hostname or "").casefold()
-                if (
-                    parsed_url.scheme != "https"
-                    or not manufacturer_domain
-                    or not (
-                        source_host == manufacturer_domain
-                        or source_host.endswith(f".{manufacturer_domain}")
-                    )
-                ):
-                    raise ValueError(
-                        f"{column} for {sensor_record['Model_Pattern']} needs "
-                        "an HTTPS source hosted by its manufacturer."
-                    )
-
-    source["Model_Base"] = source["Model"].map(
-        normalized_model_group
-    )
-    source[list(SENSOR_COLUMNS)] = "Not listed"
-    for _, sensor_record in verified_sensors.iterrows():
-        model_pattern = normalized_model_group(sensor_record["Model_Pattern"])
-        matched_models = source["Model_Base"].eq(model_pattern)
-        if not matched_models.any():
-            raise ValueError(
-                f"No source phones match verified model "
-                f"{sensor_record['Model_Pattern']!r}."
-            )
-        for column in SENSOR_COLUMNS:
-            source.loc[matched_models, column] = sensor_record[column]
-    source = source.loc[
-        ~source["Model"].astype(str).str.startswith("Synthetic ", na=False)
-    ].copy()
-    if source.empty:
-        raise ValueError("No catalog phones remain after excluding synthetic replicas.")
-
-    model_groups = source["Model_Base"]
-    if model_groups.eq("").any():
-        raise ValueError("Every phone must have a non-empty model name.")
-
-    for split_seed in range(42, 142):
-        splitter = GroupShuffleSplit(
-            n_splits=1, test_size=0.2, random_state=split_seed
-        )
-        training_indices, catalog_indices = next(
-            splitter.split(source, groups=model_groups)
-        )
-        split_frames = (
-            source.iloc[training_indices],
-            source.iloc[catalog_indices],
-        )
-        if all(
-            frame[column].nunique(dropna=True) > 1
-            for frame in split_frames
-            for column in SENSOR_COLUMNS
-        ):
-            break
-    else:
-        raise ValueError(
-            "Could not create a model-disjoint split with both known and "
-            "unknown values for every sensor field."
-        )
-    training_models = set(model_groups.iloc[training_indices])
-    catalog_models = set(model_groups.iloc[catalog_indices])
-    if training_models & catalog_models:
-        raise ValueError("A base phone model appears in both datasets.")
-    training = source.iloc[training_indices].copy()
-    catalog = source.iloc[catalog_indices].copy()
-
-    labels = recommendation_labels(training, source)
-    source[LABEL_COLUMN] = labels
-    training[LABEL_COLUMN] = source.loc[training.index, LABEL_COLUMN]
-    catalog[LABEL_COLUMN] = source.loc[catalog.index, LABEL_COLUMN]
-
-    for frame in (training, catalog):
-        frame["Price"] = pd.to_numeric(
-            frame["Price"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-            errors="coerce",
-        ).map(lambda value: f"${value:.2f}")
-        frame["RAM"] = frame["RAM"].map(
-            lambda value: f"{float(re.search(r'(\d+(?:\.\d+)?)\s*GB\s*RAM', str(value), re.I).group(1)):g} GB RAM"
-            if re.search(r"(\d+(?:\.\d+)?)\s*GB\s*RAM", str(value), re.I)
-            else "Not listed"
-        )
-    training = training.loc[:, [*CATALOG_COLUMNS, LABEL_COLUMN]].copy()
-    catalog = catalog.loc[:, [*CATALOG_COLUMNS, LABEL_COLUMN]].copy()
-    for frame in (training, catalog):
-        frame.sort_values("Phone_ID", kind="stable", inplace=True)
-
-    if training["Phone_ID"].isin(catalog["Phone_ID"]).any():
-        raise ValueError("Phone IDs overlap between training and catalog datasets.")
-    for split_name, frame in (
-        ("training", training),
-        ("test/catalog", catalog),
-    ):
-        for column in SENSOR_COLUMNS:
-            if frame[column].isna().any() or frame[column].nunique() < 2:
-                raise ValueError(
-                    f"The {split_name} split needs multiple verified/unknown "
-                    f"values in {column}; add source-backed sensor data instead "
-                    "of generating values."
-                )
-    duplicate_columns = [
-        column for column in training.columns
-        if column in catalog.columns and column not in {"Phone_ID", LABEL_COLUMN}
-    ]
-    if training[duplicate_columns].apply(tuple, axis=1).isin(
-        catalog[duplicate_columns].apply(tuple, axis=1)
-    ).any():
-        raise ValueError("An identical phone record appears in both datasets.")
-
-    training_temporary = TRAINING_PATH.with_suffix(".tmp")
-    catalog_temporary = CATALOG_PATH.with_suffix(".tmp")
-    for dataset_path in (TRAINING_PATH, CATALOG_PATH):
-        if not dataset_path.exists():
-            continue
-        try:
-            with dataset_path.open("r+b"):
-                pass
-        except OSError as error:
-            raise PermissionError(
-                f"Cannot update {dataset_path}; close applications using the "
-                "dataset and try again."
-            ) from error
-    training.to_csv(training_temporary, index=False, encoding="utf-8-sig")
-    catalog.to_csv(catalog_temporary, index=False, encoding="utf-8-sig")
-    catalog_temporary.replace(CATALOG_PATH)
-    training_temporary.replace(TRAINING_PATH)
-    return training, catalog
+    catalog = clean_source()
+    training, test = split_training_test(catalog)
+    write_datasets(training, test, catalog)
+    return training, test, catalog
 
 
 if __name__ == "__main__":
-    training_data, catalog_data = prepare_datasets()
+    training_data, test_data, _ = prepare_datasets()
     print(
-        f"Created {len(training_data)} training rows and {len(catalog_data)} "
-        f"held-out catalog/test rows."
+        f"Created {len(training_data)} training rows and {len(test_data)} "
+        "held-out test rows."
     )
-    print("Training label counts:")
-    print(training_data[LABEL_COLUMN].value_counts().to_string())
-    print("Catalog/test label counts:")
-    print(catalog_data[LABEL_COLUMN].value_counts().to_string())
+    print("Training target counts:")
+    print(training_data[SOURCE_LABEL_COLUMN].value_counts().sort_index().to_string())
+    print("Test target counts:")
+    print(test_data[SOURCE_LABEL_COLUMN].value_counts().sort_index().to_string())

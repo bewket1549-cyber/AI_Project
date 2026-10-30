@@ -11,7 +11,59 @@ from sklearn.feature_extraction.text import TfidfVectorizer
 
 
 LABEL_COLUMN = "Recommendation_Label"
+SOURCE_LABEL_COLUMN = "Recommendation"
 LABEL_THRESHOLD = 0.64
+SERIES_TIER_CODES = {"Budget": 1, "Mid-Range": 2, "Flagship": 3}
+LINK_COLUMNS = (
+    "Image_Search_URL",
+    "Video_Search_URL",
+    "GIF_Search_URL",
+)
+MODEL_FEATURE_COLUMNS = (
+    "Model",
+    "Brand",
+    "Series_Tier",
+    "Series_Tier_Code",
+    "Price_USD",
+    "Rating",
+    "Processor",
+    "RAM_GB",
+    "Storage_GB",
+    "Battery_mAh",
+    "Display_Spec",
+    "Display_Size_Inches",
+    "Refresh_Rate_Hz",
+    "Camera_Spec",
+    "Main_Camera_MP",
+    "OperatingSystem",
+    "Network_Connectivity",
+    "Has_Fingerprint",
+    "Has_Face_Unlock",
+    "Market",
+)
+MODEL_NUMERIC_FEATURES = (
+    "Series_Tier_Code",
+    "Price_USD",
+    "Rating",
+    "RAM_GB",
+    "Storage_GB",
+    "Battery_mAh",
+    "Display_Size_Inches",
+    "Refresh_Rate_Hz",
+    "Main_Camera_MP",
+    "Has_Fingerprint",
+    "Has_Face_Unlock",
+)
+MODEL_CATEGORICAL_FEATURES = (
+    "Brand",
+    "Series_Tier",
+    "Processor",
+    "Display_Spec",
+    "Camera_Spec",
+    "OperatingSystem",
+    "Network_Connectivity",
+    "Market",
+)
 CATALOG_COLUMNS = (
     "Phone_ID",
     "Model",
@@ -59,6 +111,8 @@ CATEGORICAL_FEATURES = [
 
 
 def parse_ram_gb(value):
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return float(value)
     match = re.search(r"(\d+(?:\.\d+)?)\s*GB\s*RAM", str(value), re.IGNORECASE)
     return float(match.group(1)) if match else np.nan
 
@@ -71,8 +125,9 @@ def normalized_model_group(value):
 
 
 def price_values(frame):
+    price_column = "Price_USD" if "Price_USD" in frame else "Price"
     return pd.to_numeric(
-        frame["Price"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
+        frame[price_column].astype(str).str.replace(r"[^0-9.]", "", regex=True),
         errors="coerce",
     )
 
@@ -83,16 +138,31 @@ def build_model_features(records):
         if isinstance(records, pd.Series)
         else records.copy()
     )
-    features = pd.DataFrame(index=frame.index)
-    features["Model"] = frame["Model"].fillna("").astype(str)
-    features["Price_USD"] = price_values(frame)
-    features["Rating"] = pd.to_numeric(frame["Rating"], errors="coerce")
-    features["RAM_Value"] = frame["RAM"].map(parse_ram_gb)
-    for column in NUMERIC_FEATURES[3:]:
-        features[column] = pd.to_numeric(frame[column], errors="coerce")
-    for column in CATEGORICAL_FEATURES:
-        features[column] = frame[column].fillna("Not listed").astype(str)
-    return features[["Model", *NUMERIC_FEATURES, *CATEGORICAL_FEATURES]]
+    missing_columns = set(MODEL_FEATURE_COLUMNS).difference(frame.columns)
+    if missing_columns:
+        raise ValueError(
+            "Phone records are missing model feature columns: "
+            f"{sorted(missing_columns)}"
+        )
+    features = frame.loc[:, MODEL_FEATURE_COLUMNS].copy()
+    for column in MODEL_NUMERIC_FEATURES:
+        if column in {"Has_Fingerprint", "Has_Face_Unlock"}:
+            features[column] = features[column].map(
+                {
+                    "Yes": 1,
+                    "No": 0,
+                    "1": 1,
+                    "1.0": 1,
+                    "0": 0,
+                    "0.0": 0,
+                    "Not listed": np.nan,
+                }
+            ).fillna(features[column])
+        features[column] = pd.to_numeric(features[column], errors="coerce")
+    for column in MODEL_CATEGORICAL_FEATURES:
+        features[column] = features[column].fillna("Not listed").astype(str)
+    features["Model"] = features["Model"].fillna("").astype(str)
+    return features
 
 
 def recommendation_scores(reference, candidates):
@@ -100,7 +170,7 @@ def recommendation_scores(reference, candidates):
     candidate_features = build_model_features(candidates)
     columns = [
         "Rating",
-        "RAM_Value",
+        "RAM_GB",
         "Storage_GB",
         "Battery_mAh",
         "Display_Size_Inches",
@@ -140,7 +210,7 @@ def recommendation_labels(reference, candidates):
 
 def build_classifier(training):
     preprocessors = [
-        ("numeric", SimpleImputer(strategy="median"), NUMERIC_FEATURES),
+        ("numeric", SimpleImputer(strategy="median"), MODEL_NUMERIC_FEATURES),
         (
             "categorical",
             Pipeline(
@@ -149,7 +219,7 @@ def build_classifier(training):
                     ("encoder", OneHotEncoder(handle_unknown="ignore")),
                 ]
             ),
-            CATEGORICAL_FEATURES,
+            MODEL_CATEGORICAL_FEATURES,
         ),
         (
             "model_text",
@@ -175,8 +245,22 @@ def build_classifier(training):
             ),
         ]
     )
+    if SOURCE_LABEL_COLUMN in training:
+        labels = pd.to_numeric(
+            training[SOURCE_LABEL_COLUMN], errors="raise"
+        ).map({0: "Not Recommended", 1: "Recommended"})
+        if labels.isna().any():
+            raise ValueError(
+                f"{SOURCE_LABEL_COLUMN} values must be binary 0/1 labels."
+            )
+    elif LABEL_COLUMN in training:
+        labels = training[LABEL_COLUMN].astype(str)
+    else:
+        raise ValueError(
+            f"Training data must include {SOURCE_LABEL_COLUMN}."
+        )
     classifier.fit(
         build_model_features(training),
-        training[LABEL_COLUMN].astype(str),
+        labels,
     )
     return classifier

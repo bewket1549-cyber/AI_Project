@@ -9,6 +9,15 @@ let mockCatalogMaxPrice;
 beforeEach(() => {
   mockCatalogMaxPrice = 1943.4;
   axios.get.mockImplementation((url) => {
+    if (url.endsWith("/model/metrics")) {
+      return Promise.resolve({ data: {
+        test_rows: 600,
+        accuracy: 0.9967,
+        precision: 0.9942,
+        recall: 0.9942,
+        f1: 0.9942,
+      } });
+    }
     if (url.endsWith("/admin/status")) {
       return Promise.resolve({ data: { configured: false } });
     }
@@ -21,9 +30,14 @@ beforeEach(() => {
           refresh_rate_hz: [120],
           camera_mp: [50],
           models: ["Nothing Phone 2a"],
+          brands: ["Nothing"],
+          series_tiers: ["Budget", "Mid-Range", "Flagship"],
           processors: ["Dimensity 7200 Pro"],
           operating_systems: ["Android v14"],
           specifications: ["5G, Wi-Fi"],
+          display_specs: ["6.7 inches, 1084 x 2412 px, 120 Hz Display"],
+          camera_specs: ["50 MP + 50 MP Dual Rear & 32 MP Front Camera"],
+          network_connectivities: ["Dual Sim, 3G, 4G, 5G, VoLTE, Wi-Fi"],
           memories: ["Memory Card supported"],
           markets: ["US"],
           ratings: [73],
@@ -78,6 +92,8 @@ beforeEach(() => {
             memory: "Memory Card supported",
             has_fingerprint: "Not listed",
             has_face_unlock: "Not listed",
+            brand: "Example",
+            series_tier: "Budget",
             exact_match: true,
             match_score: 100,
             market: "US",
@@ -125,6 +141,26 @@ beforeEach(() => {
             }],
             total: 1,
           }
+      : url.endsWith("/phones/predict-new")
+        ? {
+            recommendation: "Recommended",
+            recommended: true,
+            recommendation_reason: "8 of the 11 most similar catalog phones are labeled Recommended.",
+            neighbors_used: 11,
+            vote_counts: { Recommended: 8, "Not Recommended": 3 },
+            random_forest_prediction: "Recommended",
+            random_forest_confidence: 92.5,
+            neighbors: Array.from({ length: 11 }, (_, index) => ({
+              phone_id: index + 1,
+              model: `Similar Phone ${index + 1}`,
+              price_usd: 250 + index,
+              ram_gb: 8,
+              storage_gb: 128,
+              similarity_score: 95 - index,
+              model_name_similarity_score: 80 - index,
+              recommendation_label: index < 8 ? "Recommended" : "Not Recommended",
+            })),
+          }
       : url.endsWith("/admin/login")
       ? { access_token: "admin-session-token" }
       : url.endsWith("/admin/phones")
@@ -171,13 +207,87 @@ test("admin signup checks that both passwords match", async () => {
   );
 });
 
-test("welcome has one get-started action to open the existing phone finder", async () => {
+test("welcome opens either the phone finder or the new-phone prediction page", async () => {
   render(<App />);
 
   expect(screen.getByRole("heading", { name: "Find the phone that fits your life." })).toBeInTheDocument();
-  expect(screen.getAllByRole("button", { name: "Find my phone" })).toHaveLength(1);
+  expect(screen.getByRole("button", { name: "Predict a new phone" })).toBeInTheDocument();
   fireEvent.click(screen.getByRole("button", { name: "Find my phone" }));
   expect(await screen.findByRole("heading", { name: "Nothing Phone 2a" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Back to home" })).toBeInTheDocument();
+  expect(screen.queryByText("2024 source catalog")).not.toBeInTheDocument();
+  fireEvent.click(screen.getByRole("button", { name: "Back to home" }));
+  expect(await screen.findByRole("heading", { name: "Find the phone that fits your life." })).toBeInTheDocument();
+});
+
+test("new-phone prediction omits optional inputs and displays the 11 closest phones", async () => {
+  render(<App />);
+  fireEvent.click(screen.getByRole("button", { name: "Predict a new phone" }));
+  expect(await screen.findByRole("heading", { name: "Predict a phone recommendation" })).toBeInTheDocument();
+  expect(document.querySelector(".prediction-heading").parentElement)
+    .toContainElement(document.querySelector(".prediction-scroll-area"));
+  expect(document.querySelector(".prediction-scroll-area"))
+    .toContainElement(screen.getByRole("heading", { name: "Phone details" }));
+  expect(document.querySelector(".prediction-heading"))
+    .not.toContainElement(document.querySelector(".prediction-scroll-area"));
+
+  const values = {
+    "Phone model": "Example Phone X",
+    Brand: "Example",
+    "Series tier": "Mid-Range",
+    "Price (USD)": "299",
+    Processor: "Snapdragon 7 Gen",
+    "RAM (GB)": "8",
+    "Storage (GB)": "128",
+    "Battery (mAh)": "5000",
+    "Display size (inches)": "6.7",
+    "Refresh rate (Hz)": "120",
+    "Main camera (MP)": "50",
+    "Operating system": "Android 15",
+    "Network connectivity": "Dual Sim, 4G, 5G, Wi-Fi",
+  };
+  expect(screen.queryByLabelText("Rating (0-100)")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Display specification")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Camera specification")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Market")).not.toBeInTheDocument();
+  Object.entries(values).forEach(([label, value]) => {
+    fireEvent.change(screen.getByLabelText(label), { target: { value } });
+  });
+  fireEvent.change(screen.getByLabelText("Fingerprint sensor"), { target: { value: "Yes" } });
+  fireEvent.change(screen.getByLabelText("Face unlock"), { target: { value: "No" } });
+  fireEvent.click(screen.getByRole("button", { name: "Find 11 matches and predict" }));
+
+  expect(await screen.findByRole("heading", { name: "Recommended" })).toBeInTheDocument();
+  expect(screen.getByText("8 of 11 closest phones recommend it; 3 do not.")).toBeInTheDocument();
+  expect(screen.getAllByText(/% match/)).toHaveLength(11);
+  expect(screen.getAllByText(/Name match:/)).toHaveLength(11);
+  expect(screen.getByText("Random Forest test scores")).toBeInTheDocument();
+  expect(screen.getByText("Evaluated on 600 held-out phones")).toBeInTheDocument();
+  expect(within(document.querySelector(".prediction-metrics-grid")).getAllByText(/%/))
+    .toHaveLength(4);
+  expect(within(document.querySelector(".prediction-metrics-grid")).getAllByText(/%/).map((node) => node.textContent))
+    .toEqual(["99.7%", "99.4%", "99.4%", "99.4%"]);
+  expect(document.querySelector(".prediction-label")).toHaveClass("is-recommended");
+  expect(document.querySelectorAll(".neighbor-recommendation.is-recommended")).toHaveLength(8);
+  expect(document.querySelectorAll(".neighbor-recommendation.is-not-recommended")).toHaveLength(3);
+  expect(axios.post).toHaveBeenCalledWith(
+    expect.stringContaining("/phones/predict-new"),
+    expect.objectContaining({
+      model: "Example Phone X",
+      brand: "Example",
+      series_tier: "Mid-Range",
+      price_usd: 299,
+      ram_gb: 8,
+      has_fingerprint: "Yes",
+      has_face_unlock: "No",
+    })
+  );
+  const predictionPayload = axios.post.mock.calls.find(([url]) =>
+    url.endsWith("/phones/predict-new")
+  )[1];
+  ["rating", "display_spec", "camera_spec", "market"].forEach((field) => {
+    expect(predictionPayload).not.toHaveProperty(field);
+  });
 });
 
 test("admin link is available on the welcome page", async () => {
@@ -249,6 +359,8 @@ test("adding a phone refreshes the finder price range", async () => {
 
   const newPhone = {
     Model: "New Price Phone",
+    Brand: "Example",
+    "Series tier": "Budget",
     "Price (USD)": "2400",
     "Rating (0-100)": "90",
     Processor: "Example processor",
@@ -264,9 +376,9 @@ test("adding a phone refreshes the finder price range", async () => {
     fireEvent.change(screen.getByLabelText(label), { target: { value } });
   });
   mockCatalogMaxPrice = 2400;
-  fireEvent.click(screen.getByRole("button", { name: "Add to dataset" }));
+  fireEvent.click(screen.getByRole("button", { name: "Create phone" }));
 
-  expect(await screen.findByRole("status")).toHaveTextContent("Phone added to the CSV dataset.");
+  expect(await screen.findByRole("status")).toHaveTextContent("Phone added.");
   expect(axios.post).toHaveBeenCalledWith(
     expect.stringContaining("/admin/phones"),
     expect.objectContaining({
@@ -471,21 +583,13 @@ test("downloads a separate PDF for an individual phone", async () => {
   clickLink.mockRestore();
 });
 
-test("AI recommendations use user-selected specifications and show dataset-based scores", async () => {
+test("finder keeps clear filters and per-phone recommendations without a sidebar recommendations button", async () => {
   render(<App />);
   fireEvent.click(screen.getByRole("button", { name: "Find my phone" }));
   await screen.findByRole("heading", { name: "Nothing Phone 2a" });
-  fireEvent.change(screen.getByLabelText("RAM"), { target: { value: "8" } });
-  fireEvent.click(screen.getByRole("button", { name: "Get AI recommendations" }));
-
-  expect(await screen.findByText("AI recommendation")).toBeInTheDocument();
-  expect(screen.getByText("Recommendation score: 88/100")).toBeInTheDocument();
-  expect(screen.getByText("Preference match: 90%")).toBeInTheDocument();
-  expect(screen.getByText("Model confidence: 92%")).toBeInTheDocument();
-  expect(axios.post).toHaveBeenCalledWith(
-    expect.stringContaining("/phones/recommendations"),
-    expect.objectContaining({ ram_gb: "8", offset: 0, limit: 24 })
-  );
+  expect(screen.queryByRole("button", { name: "Get AI recommendations" })).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Clear filters" })).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Get AI Recommendation" })).toBeInTheDocument();
 });
 
 test("each phone card opens a detailed AI recommendation modal", async () => {

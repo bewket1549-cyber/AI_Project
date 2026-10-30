@@ -4,6 +4,8 @@ import axios from "axios";
 const API_URL = process.env.REACT_APP_API_URL || "http://127.0.0.1:8000";
 const emptyPhone = {
   model: "",
+  brand: "",
+  series_tier: "Budget",
   price_usd: "",
   rating: "",
   processor: "",
@@ -27,6 +29,8 @@ const emptyPhone = {
 
 const fields = [
   ["model", "model", "text", true],
+  ["brand", "brand", "text", true],
+  ["series_tier", "seriesTier", "select", true],
   ["price_usd", "price", "number", true],
   ["rating", "rating", "number", true],
   ["processor", "processor", "text", true],
@@ -48,6 +52,7 @@ const fields = [
 
 const datasetOptionsByField = {
   model: "models",
+  brand: "brands",
   price_usd: "prices",
   rating: "ratings",
   processor: "processors",
@@ -87,7 +92,6 @@ const adminTranslations = {
     alreadyAccount: "Already created the admin account?",
     needAccount: "Need to create the admin account?",
     manage: "Manage smartphones",
-    changes: "Changes are saved to the CSV dataset. Prices are stored directly in USD.",
     addPhone: "Add phone",
     findPhone: "Find a phone",
     searchModel: "Search by model",
@@ -96,6 +100,8 @@ const adminTranslations = {
     editPhone: "Edit phone",
     newPhone: "Add a new phone",
     model: "Model",
+    brand: "Brand",
+    seriesTier: "Series tier",
     price: "Price (USD)",
     rating: "Rating (0-100)",
     processor: "Processor",
@@ -120,12 +126,12 @@ const adminTranslations = {
     no: "No",
     saving: "Saving...",
     save: "Save changes",
-    addToDataset: "Add to dataset",
+    addToDataset: "Create phone",
     delete: "Delete phone",
-    confirmDelete: "Delete this phone from the dataset?",
-    added: "Phone added to the CSV dataset.",
-    updated: "Phone updated in the CSV dataset.",
-    deleted: "Phone deleted from the CSV dataset.",
+    confirmDelete: "Delete this phone?",
+    added: "Phone added.",
+    updated: "Phone updated.",
+    deleted: "Phone deleted.",
     accountCreated: "Admin account created. Sign in to manage the catalog.",
     requestFailed: "The admin request failed. Check the backend and try again.",
     catalogRefreshFailed: "The catalog was changed, but the finder price range could not be refreshed.",
@@ -156,7 +162,6 @@ const adminTranslations = {
     alreadyAccount: "የአስተዳዳሪ መለያ አለዎት?",
     needAccount: "የአስተዳዳሪ መለያ ይፈጥሩ?",
     manage: "ስልኮችን ያስተዳድሩ",
-    changes: "ለውጦች በCSV ዳታው ውስጥ ይቀመጣሉ። ዋጋዎች በUSD ይቀመጣሉ።",
     addPhone: "ስልክ ጨምር",
     findPhone: "ስልክ ፈልግ",
     searchModel: "በሞዴል ፈልግ",
@@ -165,6 +170,8 @@ const adminTranslations = {
     editPhone: "ስልክ አስተካክል",
     newPhone: "አዲስ ስልክ ጨምር",
     model: "ሞዴል",
+    brand: "ብራንድ",
+    seriesTier: "የምርት ደረጃ",
     price: "ዋጋ (USD)",
     rating: "ደረጃ (0-100)",
     processor: "ፕሮሰሰር",
@@ -189,12 +196,12 @@ const adminTranslations = {
     no: "አይ",
     saving: "በማስቀመጥ ላይ...",
     save: "ለውጦችን አስቀምጥ",
-    addToDataset: "ወደ ዳታው ጨምር",
+    addToDataset: "ስልክ ፍጠር",
     delete: "ስልኩን ሰርዝ",
-    confirmDelete: "ይህን ስልክ ከዳታው ላይ ይሰርዙ?",
-    added: "ስልኩ ወደ CSV ዳታው ተጨምሯል።",
+    confirmDelete: "ይህን ስልክ ይሰርዙ?",
+    added: "ስልኩ ተጨምሯል።",
     updated: "የስልኩ መረጃ ተስተካክሏል።",
-    deleted: "ስልኩ ከCSV ዳታው ተሰርዟል።",
+    deleted: "ስልኩ ተሰርዟል።",
     accountCreated: "የአስተዳዳሪ መለያ ተፈጥሯል። ለመቀጠል ይግቡ።",
     requestFailed: "ጥያቄው አልተሳካም። ባክኤንዱን ያረጋግጡና እንደገና ይሞክሩ።",
     catalogRefreshFailed: "ዳታው ተቀይሯል፣ ግን የፈላጊውን የዋጋ ክልል ማደስ አልተቻለም።",
@@ -608,22 +615,36 @@ function AdminPanel({
                   {fields.map(([name, label, type, required]) => (
                     <div className="filter-field" key={name}>
                       <label htmlFor={`admin-${name}`}>{text[label]}</label>
-                      <input
-                        id={`admin-${name}`}
-                        name={name}
-                        type={type}
-                        min={name === "rating" ? "0" : undefined}
-                        max={name === "rating" ? "100" : undefined}
-                        step={name === "display_size_inches" || name === "price_usd" || name === "rating" ? "0.01" : "1"}
-                        list={
-                          (options[datasetOptionsByField[name]] || []).length
-                            ? `admin-${name}-options`
-                            : undefined
-                        }
-                        value={form[name]}
-                        onChange={updateForm}
-                        required={required}
-                      />
+                      {type === "select" ? (
+                        <select
+                          id={`admin-${name}`}
+                          name={name}
+                          value={form[name]}
+                          onChange={updateForm}
+                          required={required}
+                        >
+                          {["Budget", "Mid-Range", "Flagship"].map((tier) => (
+                            <option key={tier} value={tier}>{tier}</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <input
+                          id={`admin-${name}`}
+                          name={name}
+                          type={type}
+                          min={name === "rating" ? "0" : undefined}
+                          max={name === "rating" ? "100" : undefined}
+                          step={name === "display_size_inches" || name === "price_usd" || name === "rating" ? "0.01" : "1"}
+                          list={
+                            (options[datasetOptionsByField[name]] || []).length
+                              ? `admin-${name}-options`
+                              : undefined
+                          }
+                          value={form[name]}
+                          onChange={updateForm}
+                          required={required}
+                        />
+                      )}
                     </div>
                   ))}
                   {Object.entries(datasetOptionsByField).map(([name, optionKey]) => (

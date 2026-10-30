@@ -17,12 +17,28 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 import pandas as pd
 from pydantic import BaseModel, Field
-from sklearn.metrics import accuracy_score, f1_score, precision_score, recall_score
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    classification_report,
+    cohen_kappa_score,
+    confusion_matrix,
+    f1_score,
+    log_loss,
+    matthews_corrcoef,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 
 if __package__:
     from .recommendation_model import (
-        CATALOG_COLUMNS,
+        LINK_COLUMNS,
         LABEL_COLUMN,
+        MODEL_FEATURE_COLUMNS,
+        SERIES_TIER_CODES,
+        SOURCE_LABEL_COLUMN,
         build_classifier,
         build_model_features,
         normalized_model_group,
@@ -32,8 +48,11 @@ if __package__:
     )
 else:
     from recommendation_model import (
-        CATALOG_COLUMNS,
+        LINK_COLUMNS,
         LABEL_COLUMN,
+        MODEL_FEATURE_COLUMNS,
+        SERIES_TIER_CODES,
+        SOURCE_LABEL_COLUMN,
         build_classifier,
         build_model_features,
         normalized_model_group,
@@ -45,16 +64,26 @@ else:
 app = FastAPI(title="Smartphone Recommendation API")
 INR_TO_USD_RATE = 0.010513
 EXCHANGE_RATE_DATE = "2026-10-27"
-DATASET_PATH = Path(__file__).with_name("Phone_Recommendation_Catalog_Verified.csv")
+DATASET_PATH = Path(__file__).with_name("SmartphoneDataset_Catalog_Clean.csv")
 TRAINING_DATASET_PATH = Path(__file__).with_name(
-    "Smartphone_Recommendation_Training_Verified.csv"
+    "SmartphoneDataset_Training_Clean.csv"
 )
+TEST_DATASET_PATH = Path(__file__).with_name("SmartphoneDataset_Test.csv")
 AUTH_DATABASE_PATH = Path(__file__).with_name("admin_auth.sqlite3")
 POPULARITY_DATABASE_PATH = Path(__file__).with_name("phone_popularity.sqlite3")
 SESSION_TTL_SECONDS = 8 * 60 * 60
 PASSWORD_ITERATIONS = 310_000
 TEXT_SEARCH_THRESHOLD = 0.72
-EXPECTED_DATASET_COLUMNS = {*CATALOG_COLUMNS, LABEL_COLUMN}
+ID_COLUMN = "Phone_ID"
+SOURCE_DATASET_COLUMNS = (
+    ID_COLUMN,
+    *MODEL_FEATURE_COLUMNS,
+    SOURCE_LABEL_COLUMN,
+    *LINK_COLUMNS,
+)
+EXPECTED_SOURCE_COLUMNS = {
+    *SOURCE_DATASET_COLUMNS,
+}
 
 # Enable CORS for React Frontend
 app.add_middleware(
@@ -65,14 +94,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-df = pd.read_csv(DATASET_PATH)
-training_df = pd.read_csv(TRAINING_DATASET_PATH)
-for dataset_name, dataset in (
-    ("catalog", df),
-    ("training", training_df),
-):
-    unexpected_columns = set(dataset.columns).difference(EXPECTED_DATASET_COLUMNS)
-    missing_columns = EXPECTED_DATASET_COLUMNS.difference(dataset.columns)
+def validate_source_dataset(dataset_name, dataset):
+    unexpected_columns = set(dataset.columns).difference(EXPECTED_SOURCE_COLUMNS)
+    missing_columns = EXPECTED_SOURCE_COLUMNS.difference(dataset.columns)
     if unexpected_columns:
         raise ValueError(
             f"The {dataset_name} dataset contains unexpected columns: "
@@ -83,36 +107,78 @@ for dataset_name, dataset in (
             f"The {dataset_name} dataset is missing columns: "
             f"{sorted(missing_columns)}"
         )
-    if LABEL_COLUMN not in dataset.columns:
-        raise ValueError(f"The {dataset_name} dataset is missing {LABEL_COLUMN}.")
-    if not set(dataset[LABEL_COLUMN].dropna().astype(str)).issubset(
-        {"Recommended", "Not Recommended"}
+    if dataset.empty:
+        raise ValueError(f"The {dataset_name} dataset has no rows.")
+    if dataset[ID_COLUMN].isna().any() or dataset[ID_COLUMN].duplicated().any():
+        raise ValueError(f"The {dataset_name} dataset has invalid phone IDs.")
+    if not set(pd.to_numeric(dataset[SOURCE_LABEL_COLUMN], errors="coerce")).issubset(
+        {0, 1}
     ):
-        raise ValueError(f"The {dataset_name} dataset has invalid recommendation labels.")
-    if dataset[["Has_Fingerprint", "Has_Face_Unlock"]].isna().any().any():
-        raise ValueError(f"The {dataset_name} dataset has missing sensor values.")
-    for column in ("Has_Fingerprint", "Has_Face_Unlock"):
-        if not set(dataset[column].astype(str)).issubset(
-            {"Yes", "No", "Not listed"}
-        ):
-            raise ValueError(
-                f"The {dataset_name} dataset has invalid values in {column}."
-            )
+        raise ValueError(
+            f"The {dataset_name} dataset must use binary {SOURCE_LABEL_COLUMN} labels."
+        )
+    if dataset[list(MODEL_FEATURE_COLUMNS)].isna().any().any():
+        raise ValueError(f"The {dataset_name} dataset has missing model features.")
 
+
+raw_df = pd.read_csv(DATASET_PATH)
+raw_training_df = pd.read_csv(TRAINING_DATASET_PATH)
+raw_test_df = pd.read_csv(TEST_DATASET_PATH)
+for dataset_name, dataset in (
+    ("catalog", raw_df),
+    ("training", raw_training_df),
+    ("test", raw_test_df),
+):
+    validate_source_dataset(dataset_name, dataset)
+
+if set(raw_training_df[ID_COLUMN]) & set(raw_test_df[ID_COLUMN]):
+    raise ValueError("A phone ID appears in both training and test datasets.")
+if raw_df.drop(columns=[SOURCE_LABEL_COLUMN]).duplicated().any():
+    raise ValueError("The smartphone dataset contains duplicate phone records.")
+
+
+def build_api_dataset(source):
+    frame = source.copy()
+    frame["Price"] = frame["Price_USD"].map(lambda value: f"${value:.2f}")
+    frame["Specification"] = frame["Network_Connectivity"]
+    frame["RAM"] = frame["RAM_GB"].map(lambda value: f"{value:g} GB RAM")
+    frame["Camera"] = frame["Camera_Spec"]
+    frame["Memory"] = "Not listed"
+    frame["Internal_Storage"] = frame["Storage_GB"].map(
+        lambda value: f"{value:g} GB" if value > 0 else "Not listed"
+    )
+    for column in ("Has_Fingerprint", "Has_Face_Unlock"):
+        frame[column] = frame[column].map(
+            {
+                1: "Yes",
+                1.0: "Yes",
+                "1": "Yes",
+                "1.0": "Yes",
+                0: "No",
+                0.0: "No",
+                "0": "No",
+                "0.0": "No",
+            }
+        ).fillna("Not listed")
+    frame[LABEL_COLUMN] = frame[SOURCE_LABEL_COLUMN].map(
+        {1: "Recommended", 0: "Not Recommended"}
+    )
+    return frame
+
+
+df = build_api_dataset(raw_df)
+training_df = build_api_dataset(raw_training_df)
+test_df = build_api_dataset(raw_test_df)
 df["_price_usd"] = price_values(df)
 training_df["_price_usd"] = price_values(training_df)
-if df["_price_usd"].isna().any():
-    raise ValueError(f"{DATASET_PATH} contains missing or invalid smartphone prices.")
-if training_df["_price_usd"].isna().any():
-    raise ValueError(
-        f"{TRAINING_DATASET_PATH} contains missing or invalid smartphone prices."
-    )
-if set(df["Model"].map(normalized_model_group)) & set(
-    training_df["Model"].map(normalized_model_group)
+test_df["_price_usd"] = price_values(test_df)
+for dataset_name, dataset in (
+    ("catalog", df),
+    ("training", training_df),
+    ("test", test_df),
 ):
-    raise ValueError("A phone model appears in both training and catalog datasets.")
-if df.drop(columns=[LABEL_COLUMN]).duplicated().any():
-    raise ValueError("The user catalog contains duplicate phone records.")
+    if dataset["_price_usd"].isna().any():
+        raise ValueError(f"The {dataset_name} dataset has invalid smartphone prices.")
 
 
 @contextlib.contextmanager
@@ -183,16 +249,52 @@ model = build_classifier(training_df)
 
 def evaluate_model(test_data):
     test_labels = test_data[LABEL_COLUMN].astype(str)
-    test_predictions = model.predict(build_model_features(test_data))
+    test_features = build_model_features(test_data)
+    test_predictions = model.predict(test_features)
+    positive_class = "Recommended"
+    negative_class = "Not Recommended"
+    class_labels = [negative_class, positive_class]
+    positive_class_index = list(model.classes_).index(positive_class)
+    predicted_probabilities = model.predict_proba(test_features)[
+        :, positive_class_index
+    ]
+    matrix = confusion_matrix(
+        test_labels, test_predictions, labels=class_labels
+    )
+    true_negative, false_positive, false_negative, true_positive = (
+        int(value) for value in matrix.ravel()
+    )
+    specificity = (
+        true_negative / (true_negative + false_positive)
+        if true_negative + false_positive
+        else 0.0
+    )
+    report = classification_report(
+        test_labels,
+        test_predictions,
+        labels=class_labels,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    def format_class_metrics(metrics):
+        return {
+            metric: round(float(value), 4) if metric != "support" else int(value)
+            for metric, value in metrics.items()
+        }
+
     return {
         "test_rows": int(len(test_data)),
         "accuracy": round(float(accuracy_score(test_labels, test_predictions)), 4),
+        "balanced_accuracy": round(
+            float(balanced_accuracy_score(test_labels, test_predictions)), 4
+        ),
         "precision": round(
             float(
                 precision_score(
                     test_labels,
                     test_predictions,
-                    pos_label="Recommended",
+                    pos_label=positive_class,
                     zero_division=0,
                 )
             ),
@@ -203,7 +305,7 @@ def evaluate_model(test_data):
                 recall_score(
                     test_labels,
                     test_predictions,
-                    pos_label="Recommended",
+                    pos_label=positive_class,
                     zero_division=0,
                 )
             ),
@@ -214,19 +316,63 @@ def evaluate_model(test_data):
                 f1_score(
                     test_labels,
                     test_predictions,
-                    pos_label="Recommended",
+                    pos_label=positive_class,
                     zero_division=0,
                 )
             ),
             4,
         ),
+        "specificity": round(specificity, 4),
+        "roc_auc": round(
+            float(roc_auc_score(test_labels, predicted_probabilities)), 4
+        ),
+        "average_precision": round(
+            float(
+                average_precision_score(
+                    test_labels,
+                    predicted_probabilities,
+                    pos_label=positive_class,
+                )
+            ),
+            4,
+        ),
+        "matthews_correlation_coefficient": round(
+            float(matthews_corrcoef(test_labels, test_predictions)), 4
+        ),
+        "cohen_kappa": round(
+            float(cohen_kappa_score(test_labels, test_predictions)), 4
+        ),
+        "log_loss": round(
+            float(
+                log_loss(
+                    test_labels,
+                    model.predict_proba(test_features),
+                    labels=model.classes_,
+                )
+            ),
+            4,
+        ),
+        "per_class_metrics": {
+            label: format_class_metrics(report[label])
+            for label in class_labels
+        },
+        "macro_avg": format_class_metrics(report["macro avg"]),
+        "weighted_avg": format_class_metrics(report["weighted avg"]),
+        "confusion_matrix": {
+            "labels": class_labels,
+            "matrix": matrix.tolist(),
+            "true_negative": true_negative,
+            "false_positive": false_positive,
+            "false_negative": false_negative,
+            "true_positive": true_positive,
+        },
         "training_rows": int(len(training_df)),
         "training_model_groups": int(training_df["Model"].map(normalized_model_group).nunique()),
         "test_model_groups": int(test_data["Model"].map(normalized_model_group).nunique()),
     }
 
 
-model_metrics = evaluate_model(df)
+model_metrics = evaluate_model(test_df)
 
 
 @app.get("/model/metrics")
@@ -234,15 +380,22 @@ def get_model_metrics():
     return {
         "model": "RandomForestClassifier",
         "text_features": "TF-IDF word and word-pair features from phone model names",
-        "target": LABEL_COLUMN,
-        "label_source": "Rule-generated weak labels; not human-verified recommendations",
+        "target": SOURCE_LABEL_COLUMN,
+        "feature_columns": list(MODEL_FEATURE_COLUMNS),
+        "excluded_columns": [ID_COLUMN, *LINK_COLUMNS],
+        "label_source": "Dataset-provided recommendation labels; not human-verified",
         **model_metrics,
     }
 
 
 def persist_dataset(updated_df):
     temporary_path = DATASET_PATH.with_suffix(".tmp")
-    updated_df.drop(columns=["_price_usd"], errors="ignore").to_csv(
+    source = updated_df.loc[:, SOURCE_DATASET_COLUMNS].copy()
+    for column in ("Has_Fingerprint", "Has_Face_Unlock"):
+        source[column] = source[column].map(
+            {"Yes": 1, "No": 0}
+        ).fillna(source[column])
+    source.to_csv(
         temporary_path, index=False, encoding="utf-8-sig"
     )
     temporary_path.replace(DATASET_PATH)
@@ -298,6 +451,8 @@ class AdminSignup(BaseModel):
 
 class AdminPhoneInput(BaseModel):
     model: str = Field(min_length=1, max_length=120)
+    brand: str = Field(min_length=1, max_length=80)
+    series_tier: Literal["Budget", "Mid-Range", "Flagship"]
     price_usd: float = Field(gt=0)
     rating: float = Field(ge=0, le=100)
     processor: str = Field(min_length=1, max_length=120)
@@ -317,6 +472,28 @@ class AdminPhoneInput(BaseModel):
     image_search_url: str = Field(default="", max_length=2000)
     video_search_url: str = Field(default="", max_length=2000)
     gif_search_url: str = Field(default="", max_length=2000)
+
+
+class NewPhonePredictionInput(BaseModel):
+    model: str = Field(min_length=1, max_length=120)
+    brand: str = Field(min_length=1, max_length=80)
+    series_tier: Literal["Budget", "Mid-Range", "Flagship"]
+    price_usd: float = Field(gt=0)
+    rating: Optional[float] = Field(default=None, ge=0, le=100)
+    processor: str = Field(min_length=1, max_length=300)
+    ram_gb: float = Field(ge=0, le=1024)
+    storage_gb: float = Field(ge=0, le=100000)
+    battery_mah: float = Field(ge=0, le=100000)
+    display_spec: Optional[str] = Field(default=None, max_length=1000)
+    display_size_inches: float = Field(ge=0, le=100)
+    refresh_rate_hz: float = Field(ge=0, le=1000)
+    camera_spec: Optional[str] = Field(default=None, max_length=1000)
+    main_camera_mp: float = Field(ge=0, le=10000)
+    operating_system: str = Field(min_length=1, max_length=120)
+    network_connectivity: str = Field(min_length=1, max_length=500)
+    has_fingerprint: Literal["Yes", "No"]
+    has_face_unlock: Literal["Yes", "No"]
+    market: Optional[str] = Field(default=None, max_length=80)
 
 
 class PhoneSearchInterest(BaseModel):
@@ -347,6 +524,8 @@ def admin_phone_record(phone):
     return {
         "phone_id": int(phone["Phone_ID"]),
         "model": text_value("Model"),
+        "brand": text_value("Brand"),
+        "series_tier": text_value("Series_Tier"),
         "price_usd": float(phone["_price_usd"]),
         "rating": float(phone["Rating"]) if pd.notna(phone["Rating"]) else 0,
         "processor": text_value("Processor"),
@@ -378,6 +557,10 @@ def apply_admin_phone(phone, values, phone_id):
         {
             "Phone_ID": int(phone_id),
             "Model": values["model"].strip(),
+            "Brand": values["brand"].strip(),
+            "Series_Tier": values["series_tier"],
+            "Series_Tier_Code": SERIES_TIER_CODES[values["series_tier"]],
+            "Price_USD": values["price_usd"],
             "Price": f'${values["price_usd"]:.2f}',
             "Rating": values["rating"],
             "Specification": values["specification"].strip() or (
@@ -387,18 +570,27 @@ def apply_admin_phone(phone, values, phone_id):
             ),
             "Processor": values["processor"].strip(),
             "OperatingSystem": values["operating_system"].strip(),
+            "RAM_GB": values["ram_gb"],
             "RAM": f'{values["ram_gb"]} GB RAM',
             "Internal_Storage": f'{values["storage_gb"]} GB',
             "Storage_GB": values["storage_gb"],
             "Battery_mAh": values["battery_mah"],
             "Display_Size_Inches": values["display_size_inches"],
+            "Display_Spec": (
+                f'{values["display_size_inches"]:g} inches, '
+                f'{values["refresh_rate_hz"]} Hz display'
+            ),
             "Refresh_Rate_Hz": values["refresh_rate_hz"],
             "Camera": values["camera"].strip() or f'{values["camera_mp"]} MP',
+            "Camera_Spec": values["camera"].strip()
+            or f'{values["camera_mp"]} MP camera',
             "Main_Camera_MP": values["camera_mp"],
             "Memory": values["memory"].strip(),
             "Has_Fingerprint": values["has_fingerprint"].strip(),
             "Has_Face_Unlock": values["has_face_unlock"].strip(),
             "Market": values["market"].strip(),
+            "Network_Connectivity": values["specification"].strip()
+            or "Not listed",
             "Image_Search_URL": values["image_search_url"].strip()
             or f"https://www.google.com/search?tbm=isch&q={query}",
             "Video_Search_URL": values["video_search_url"].strip()
@@ -412,10 +604,7 @@ def apply_admin_phone(phone, values, phone_id):
 
 def save_admin_dataset(updated_df):
     global df
-    updated_df["_price_usd"] = pd.to_numeric(
-        updated_df["Price"].astype(str).str.replace(r"[^0-9.]", "", regex=True),
-        errors="coerce",
-    )
+    updated_df["_price_usd"] = price_values(updated_df)
     persist_dataset(updated_df)
     df = updated_df
 
@@ -443,7 +632,7 @@ class PhoneRecommendationInput(BaseModel):
 
 @app.get("/phones/options")
 def get_phone_filter_options():
-    available_phones = pd.concat([df, training_df], ignore_index=True)
+    available_phones = df
 
     def text_options(column):
         return sorted(
@@ -475,9 +664,14 @@ def get_phone_filter_options():
         "refresh_rate_hz": numeric_options("Refresh_Rate_Hz"),
         "camera_mp": numeric_options("Main_Camera_MP"),
         "models": text_options("Model"),
+        "brands": text_options("Brand"),
+        "series_tiers": text_options("Series_Tier"),
         "processors": text_options("Processor"),
         "operating_systems": text_options("OperatingSystem"),
         "specifications": text_options("Specification"),
+        "display_specs": text_options("Display_Spec"),
+        "camera_specs": text_options("Camera_Spec"),
+        "network_connectivities": text_options("Network_Connectivity"),
         "memories": text_options("Memory"),
         "markets": text_options("Market"),
         "ratings": numeric_options("Rating", integer=False, positive_only=False),
@@ -567,6 +761,8 @@ def phone_public_record(phone):
         )
     return {
         "model": phone["Model"],
+        "brand": phone["Brand"],
+        "series_tier": phone["Series_Tier"],
         "phone_id": int(phone["Phone_ID"]),
         "price_usd": float(phone["_price_usd"]),
         "rating": float(phone["Rating"]) if pd.notna(phone["Rating"]) else None,
@@ -629,7 +825,7 @@ def rank_phone_matches(preferences, sort="model"):
         "has_face_unlock": "Has_Face_Unlock",
     }
     scored = []
-    reference = pd.concat([df, training_df], ignore_index=True, sort=False)
+    reference = df
 
     def numeric_value(frame, preference, column):
         if preference == "ram_gb":
@@ -758,7 +954,9 @@ def recommend_phones(preferences: PhoneRecommendationInput):
         ):
             selected_value = preference_data.get(preference)
             if selected_value is not None:
-                input_data.loc[:, column] = selected_value
+                input_data.loc[
+                    :, column
+                ] = 1 if selected_value == "Yes" else 0
         probabilities = model.predict_proba(input_data)[0]
         recommended_probability = float(
             probabilities[list(model.classes_).index("Recommended")] * 100
@@ -844,8 +1042,186 @@ def recommend_phone(phone_id: int, preferences: PhoneRecommendationInput):
     }
 
 
+def new_phone_similarity_scores(candidate):
+    numeric_columns = {
+        "Series_Tier_Code",
+        "Price_USD",
+        "Rating",
+        "RAM_GB",
+        "Storage_GB",
+        "Battery_mAh",
+        "Display_Size_Inches",
+        "Refresh_Rate_Hz",
+        "Main_Camera_MP",
+        "Has_Fingerprint",
+        "Has_Face_Unlock",
+    }
+    catalog_features = df.loc[:, MODEL_FEATURE_COLUMNS].copy()
+    for column in ("Has_Fingerprint", "Has_Face_Unlock"):
+        catalog_features[column] = catalog_features[column].map(
+            {"Yes": 1, "No": 0}
+        )
+    numeric_ranges = {
+        column: pd.to_numeric(catalog_features[column], errors="coerce")
+        for column in numeric_columns
+    }
+    feature_ranges = {
+        column: float(values.max() - values.min())
+        for column, values in numeric_ranges.items()
+    }
+    similarities = []
+    model_name_similarities = []
+    for _, phone in catalog_features.iterrows():
+        candidate_model = str(candidate["Model"]).strip().casefold()
+        phone_model = str(phone["Model"]).strip().casefold()
+        model_name_similarity = SequenceMatcher(
+            None, candidate_model, phone_model
+        ).ratio()
+        attribute_scores = []
+        for column in MODEL_FEATURE_COLUMNS:
+            if column == "Model":
+                continue
+            candidate_value = candidate[column]
+            if candidate_value is None or pd.isna(candidate_value):
+                continue
+            phone_value = phone[column]
+            if column in numeric_columns:
+                feature_range = feature_ranges[column]
+                numeric_phone_value = pd.to_numeric(
+                    pd.Series([phone_value]), errors="coerce"
+                ).iloc[0]
+                if pd.isna(numeric_phone_value):
+                    score = 0.5
+                else:
+                    difference = abs(float(candidate_value) - float(numeric_phone_value))
+                    score = (
+                        1.0
+                        if feature_range == 0 and difference == 0
+                        else 0.0
+                        if feature_range == 0
+                        else max(0.0, 1.0 - difference / feature_range)
+                    )
+            else:
+                candidate_text = str(candidate_value).strip().casefold()
+                phone_text = str(phone_value).strip().casefold()
+                score = SequenceMatcher(
+                    None, candidate_text, phone_text
+                ).ratio()
+            attribute_scores.append(score)
+        attribute_similarity = (
+            sum(attribute_scores) / len(attribute_scores)
+            if attribute_scores
+            else 0.5
+        )
+        similarities.append(
+            round((model_name_similarity * 0.6 + attribute_similarity * 0.4) * 100, 2)
+        )
+        model_name_similarities.append(round(model_name_similarity * 100, 2))
+    return similarities, model_name_similarities
+
+
+@app.post("/phones/predict-new")
+def predict_new_phone(phone_input: NewPhonePredictionInput):
+    if len(df) < 11:
+        raise HTTPException(
+            status_code=503,
+            detail="At least 11 catalog phones are required for similarity voting.",
+        )
+
+    input_values = phone_input.model_dump()
+    required_text_fields = (
+        "model",
+        "processor",
+        "operating_system",
+        "network_connectivity",
+    )
+    if any(not str(input_values[field]).strip() for field in required_text_fields):
+        raise HTTPException(
+            status_code=422,
+            detail="All phone description fields must contain non-blank values.",
+        )
+    candidate = {
+        "Model": input_values["model"].strip(),
+        "Brand": input_values["brand"].strip(),
+        "Series_Tier": input_values["series_tier"],
+        "Series_Tier_Code": SERIES_TIER_CODES[input_values["series_tier"]],
+        "Price_USD": input_values["price_usd"],
+        "Rating": input_values["rating"],
+        "Processor": input_values["processor"].strip(),
+        "RAM_GB": input_values["ram_gb"],
+        "Storage_GB": input_values["storage_gb"],
+        "Battery_mAh": input_values["battery_mah"],
+        "Display_Spec": input_values["display_spec"],
+        "Display_Size_Inches": input_values["display_size_inches"],
+        "Refresh_Rate_Hz": input_values["refresh_rate_hz"],
+        "Camera_Spec": input_values["camera_spec"],
+        "Main_Camera_MP": input_values["main_camera_mp"],
+        "OperatingSystem": input_values["operating_system"].strip(),
+        "Network_Connectivity": input_values["network_connectivity"].strip(),
+        "Has_Fingerprint": 1 if input_values["has_fingerprint"] == "Yes" else 0,
+        "Has_Face_Unlock": 1 if input_values["has_face_unlock"] == "Yes" else 0,
+        "Market": input_values["market"],
+    }
+    candidate_frame = pd.DataFrame([candidate])
+    probabilities = model.predict_proba(build_model_features(candidate_frame))[0]
+    random_forest_prediction = str(model.classes_[int(probabilities.argmax())])
+    random_forest_confidence = round(float(probabilities.max() * 100), 2)
+
+    similarity_scores, model_name_similarity_scores = new_phone_similarity_scores(
+        candidate
+    )
+    nearest_indices = sorted(
+        range(len(similarity_scores)),
+        key=lambda index: (-similarity_scores[index], int(df.iloc[index][ID_COLUMN])),
+    )[:11]
+    neighbors = []
+    for index in nearest_indices:
+        source_phone = df.iloc[index]
+        recommendation = (
+            "Recommended"
+            if int(source_phone[SOURCE_LABEL_COLUMN]) == 1
+            else "Not Recommended"
+        )
+        neighbors.append(
+            {
+                **phone_public_record(df.iloc[index]),
+                "similarity_score": similarity_scores[index],
+                "model_name_similarity_score": model_name_similarity_scores[index],
+                "recommendation_label": recommendation,
+            }
+        )
+
+    recommended_votes = sum(
+        neighbor["recommendation_label"] == "Recommended"
+        for neighbor in neighbors
+    )
+    not_recommended_votes = len(neighbors) - recommended_votes
+    prediction = (
+        "Recommended"
+        if recommended_votes > not_recommended_votes
+        else "Not Recommended"
+    )
+    return {
+        "recommendation": prediction,
+        "recommended": prediction == "Recommended",
+        "recommendation_reason": (
+            f"{recommended_votes} of the 11 most similar catalog phones are "
+            f"labeled Recommended; {not_recommended_votes} are labeled "
+            "Not Recommended."
+        ),
+        "neighbors_used": len(neighbors),
+        "vote_counts": {
+            "Recommended": recommended_votes,
+            "Not Recommended": not_recommended_votes,
+        },
+        "random_forest_prediction": random_forest_prediction,
+        "random_forest_confidence": random_forest_confidence,
+        "neighbors": neighbors,
+    }
+
+
 def explain_recommendation(phone, preferences, recommended):
-    reference = pd.concat([df, training_df], ignore_index=True, sort=False)
+    reference = df
 
     def percentile(column, value, parser=None):
         values = (
@@ -1095,6 +1471,7 @@ def build_phone_pdf(phones):
     }
     internal_columns = {
         LABEL_COLUMN,
+        SOURCE_LABEL_COLUMN,
     }
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
@@ -1443,11 +1820,6 @@ def get_admin_phone(phone_id: int, _: None = Depends(require_admin)):
 
 def ensure_catalog_model_is_independent(model_name, excluded_phone_id=None):
     normalized_name = normalized_model_name(model_name)
-    if normalized_name in set(training_df["Model"].map(normalized_model_name)):
-        raise HTTPException(
-            status_code=409,
-            detail="This model belongs to the training dataset and cannot be added to the catalog.",
-        )
     existing = df
     if excluded_phone_id is not None:
         existing = existing[existing["Phone_ID"].astype(str) != str(excluded_phone_id)]
@@ -1470,6 +1842,7 @@ def create_admin_phone(
     row[LABEL_COLUMN] = recommendation_labels(
         training_df, pd.DataFrame([row])
     )[0]
+    row[SOURCE_LABEL_COLUMN] = int(row[LABEL_COLUMN] == "Recommended")
     updated_df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
     save_admin_dataset(updated_df)
     return admin_phone_record(df[df["Phone_ID"].astype(str) == str(phone_id)].iloc[0])
@@ -1493,6 +1866,9 @@ def update_admin_phone(
     updated_row[LABEL_COLUMN] = recommendation_labels(
         training_df, pd.DataFrame([updated_row])
     )[0]
+    updated_row[SOURCE_LABEL_COLUMN] = int(
+        updated_row[LABEL_COLUMN] == "Recommended"
+    )
     for column in ("_price_inr", "_price_usd"):
         if column in updated_df.columns:
             updated_row[column] = updated_df.at[index, column]

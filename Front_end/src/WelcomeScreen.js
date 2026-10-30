@@ -1,6 +1,6 @@
 import React from "react";
 
-function WelcomeScreen({ language, onContinue, onLanguageChange, onAdmin }) {
+function WelcomeScreen({ language, onContinue, onPredict, onLanguageChange, onAdmin }) {
   const isAmharic = language === "am";
 
   return (
@@ -27,6 +27,9 @@ function WelcomeScreen({ language, onContinue, onLanguageChange, onAdmin }) {
           <div className="welcome-actions">
             <button type="button" className="welcome-primary" onClick={onContinue}>
               {isAmharic ? "ስልኬን ፈልግ" : "Find my phone"}
+            </button>
+            <button type="button" className="welcome-secondary" onClick={onPredict}>
+              {isAmharic ? "አዲስ ስልክ ተንብይ" : "Predict a new phone"}
             </button>
           </div>
         </div>

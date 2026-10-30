@@ -3,6 +3,7 @@ import axios from "axios";
 import "./App.css";
 import AdminPanel from "./AdminPanel";
 import WelcomeScreen from "./WelcomeScreen";
+import PredictionPage from "./PredictionPage";
 
 const API_URL = process.env.REACT_APP_API_URL || "http://127.0.0.1:8000";
 const PAGE_SIZE = 24;
@@ -10,6 +11,7 @@ const PAGE_SIZE = 24;
 const translations = {
   en: {
     eyebrow: "SMARTPHONE FINDER",
+    home: "Back to home",
     title: "Find your next phone",
     subtitle: "Search one catalog using any combination of budget and phone attributes.",
     budgetMode: "By budget",
@@ -73,7 +75,6 @@ const translations = {
     memory: "Memory / card support",
     fingerprint: "Fingerprint sensor",
     faceUnlock: "Face unlock",
-    catalog: "2024 source catalog",
     downloadPdf: "Download results as PDF",
     downloadingPdf: "Preparing PDF...",
     pdfError: "Could not create the PDF. Please try again.",
@@ -83,11 +84,7 @@ const translations = {
     popularEmpty: "Popular recommendations will appear as people search.",
     popularSearchCount: "searches",
     popularityError: "Search results loaded, but popularity data could not be updated.",
-    recommendationSearch: "Get AI recommendations",
     recommendationSearching: "Finding recommendations...",
-    recommendationError: "Could not generate dataset-based recommendations. Please try again.",
-    recommendationNeedCriteria: "Choose at least one phone feature or enter a budget.",
-    recommendationNote: "A Random Forest classifies phones using a separate model-level training split. Labels are rule-generated from value and specification scores, not human-verified recommendations.",
     recommendationBadge: "AI recommendation",
     notRecommendedBadge: "Not recommended",
     recommendationScore: "Recommendation score: {score}/100",
@@ -106,6 +103,7 @@ const translations = {
   },
   am: {
     eyebrow: "የስልክ መፈለጊያ",
+    home: "ወደ መነሻ ተመለስ",
     title: "ቀጣዩን ስልክዎን ያግኙ",
     subtitle: "በበጀት ወይም በስልክ መረጃ የሚስማማ ስልክ ያግኙ።",
     budgetMode: "በበጀት",
@@ -169,7 +167,6 @@ const translations = {
     memory: "ማህደር / የማስታወሻ ካርድ",
     fingerprint: "የጣት አሻራ ማንበቢያ",
     faceUnlock: "በፊት መክፈቻ",
-    catalog: "የ2024 መነሻ ዳታ",
     downloadPdf: "ውጤቶቹን በPDF አውርድ",
     downloadingPdf: "PDF በማዘጋጀት ላይ...",
     pdfError: "PDF ማዘጋጀት አልተቻለም። እንደገና ይሞክሩ።",
@@ -179,11 +176,7 @@ const translations = {
     popularEmpty: "ተጠቃሚዎች ሲፈልጉ ታዋቂ ስልኮች እዚህ ይታያሉ።",
     popularSearchCount: "ፍለጋ",
     popularityError: "የፍለጋ ውጤቶቹ ተጭነዋል፣ ግን የታዋቂነት መረጃ ማዘመን አልተቻለም።",
-    recommendationSearch: "በAI የተመከሩ ስልኮችን ፈልግ",
     recommendationSearching: "የሚመከሩ ስልኮችን በመፈለግ ላይ...",
-    recommendationError: "በዳታ ላይ የተመሰረተ ምክር ማዘጋጀት አልተቻለም። እንደገና ይሞክሩ።",
-    recommendationNeedCriteria: "ቢያንስ አንድ የስልክ ባህሪ ይምረጡ ወይም በጀት ያስገቡ።",
-    recommendationNote: "Random Forest загвар нь утасны model түвшинд тусгаарласан сургалтын өгөгдлөөр сурсан. Шошгыг үнэ цэнэ, үзүүлэлтийн дүрмээр үүсгэсэн; хүн баталгаажуулаагүй.",
     recommendationBadge: "በAI የተመከረ",
     notRecommendedBadge: "አይመከርም",
     recommendationScore: "የምክር ነጥብ፦ {score}/100",
@@ -262,11 +255,9 @@ function App() {
   const [phones, setPhones] = useState([]);
   const [total, setTotal] = useState(0);
   const [activeSearchParams, setActiveSearchParams] = useState({});
-  const [activeRecommendationParams, setActiveRecommendationParams] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState(false);
-  const [recommendationError, setRecommendationError] = useState(false);
   const [recommendationPhone, setRecommendationPhone] = useState(null);
   const [recommendationDetails, setRecommendationDetails] = useState(null);
   const [recommendationDetailsError, setRecommendationDetailsError] = useState(false);
@@ -330,9 +321,7 @@ function App() {
   );
 
   const recommendationPreferences = () => {
-    const preferences = {
-      ...(activeRecommendationParams || activeSearchParams),
-    };
+    const preferences = { ...activeSearchParams };
     delete preferences.sort;
     return preferences;
   };
@@ -347,11 +336,9 @@ function App() {
     setValidationError("");
     const params = searchFilterValues(values);
     if (sort !== "model") params.sort = sort;
-    setActiveRecommendationParams(null);
     setActiveSearchParams(params);
     setLoading(true);
     setError(false);
-    setRecommendationError(false);
     setHasSearched(true);
     try {
       const response = await axios.get(`${API_URL}/phones`, {
@@ -381,49 +368,9 @@ function App() {
     }
   };
 
-  const recommendPhones = async (event) => {
-    event.preventDefault();
-    const preferences = searchFilterValues(filters);
-    if (preferences.max_price && (
-      !Number.isFinite(Number(preferences.max_price)) || Number(preferences.max_price) <= 0
-    )) {
-      setValidationError("price");
-      return;
-    }
-    if (!Object.keys(preferences).length) {
-      setValidationError("recommendation");
-      return;
-    }
-    setValidationError("");
-    setLoading(true);
-    setError(false);
-    setRecommendationError(false);
-    setHasSearched(true);
-    setActiveSearchParams({});
-    setActiveRecommendationParams(preferences);
-    try {
-      const response = await axios.post(`${API_URL}/phones/recommendations`, {
-        ...preferences,
-        offset: 0,
-        limit: PAGE_SIZE,
-      });
-      setPhones(response.data.items);
-      setTotal(response.data.total);
-    } catch (requestError) {
-      setActiveRecommendationParams(null);
-      setRecommendationError(true);
-      setPhones([]);
-      setTotal(0);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const clearFilters = () => {
     setFilters({ ...emptyFilters });
     setValidationError("");
-    setRecommendationError(false);
-    setActiveRecommendationParams(null);
     searchPhones(null, emptyFilters);
   };
 
@@ -473,15 +420,9 @@ function App() {
     setLoadingMore(true);
     setError(false);
     try {
-      const response = activeRecommendationParams
-        ? await axios.post(`${API_URL}/phones/recommendations`, {
-            ...activeRecommendationParams,
-            offset: phones.length,
-            limit: PAGE_SIZE,
-          })
-        : await axios.get(`${API_URL}/phones`, {
-            params: requestParams(activeSearchParams, phones.length),
-          });
+      const response = await axios.get(`${API_URL}/phones`, {
+        params: requestParams(activeSearchParams, phones.length),
+      });
       setPhones((currentPhones) => [...currentPhones, ...response.data.items]);
       setTotal(response.data.total);
     } catch (requestError) {
@@ -537,8 +478,18 @@ function App() {
       <WelcomeScreen
         language={language}
         onContinue={() => setScreen("finder")}
+        onPredict={() => setScreen("prediction")}
         onAdmin={() => setScreen("admin")}
         onLanguageChange={setLanguage}
+      />
+    );
+  }
+
+  if (screen === "prediction") {
+    return (
+      <PredictionPage
+        language={language}
+        onBack={() => setScreen("welcome")}
       />
     );
   }
@@ -565,7 +516,7 @@ function App() {
           <span>MELA</span>
         </a>
         <div className="topbar-meta">
-          <span className="catalog-label">{text.catalog}</span>
+          <button type="button" className="admin-open" onClick={() => setScreen("welcome")}>{text.home}</button>
           <button type="button" className="admin-open" onClick={() => setScreen("admin")}>Admin</button>
           <div className="language-switch" aria-label={text.languageLabel}>
             <button
@@ -650,9 +601,7 @@ function App() {
                     ? text.budgetRequired
                     : validationError === "price"
                       ? text.invalidPrice
-                      : validationError === "recommendation"
-                        ? text.recommendationNeedCriteria
-                        : text.invalidRange}
+                      : text.invalidRange}
                 </p>
               )}
               <datalist id="model-options">{options.models.map((value) => <option key={value} value={value} />)}</datalist>
@@ -677,16 +626,6 @@ function App() {
                   {text.clear}
                 </button>
               </div>
-              <button
-                className="recommendation-search-button"
-                type="button"
-                onClick={recommendPhones}
-                disabled={loading}
-              >
-                {loading && activeRecommendationParams
-                  ? text.recommendationSearching
-                  : text.recommendationSearch}
-              </button>
             </form>
           </aside>
 
@@ -697,20 +636,14 @@ function App() {
                 <h2>{shownText}</h2>
               </div>
               <div className="results-actions">
-                {!activeRecommendationParams && (
-                  <button className="pdf-button" type="button" onClick={() => downloadPdf()} disabled={exportingPdf}>
-                    {exportingPdf ? text.downloadingPdf : text.downloadPdf}
-                  </button>
-                )}
+                <button className="pdf-button" type="button" onClick={() => downloadPdf()} disabled={exportingPdf}>
+                  {exportingPdf ? text.downloadingPdf : text.downloadPdf}
+                </button>
                 <span className="results-count">{total.toLocaleString()}</span>
               </div>
             </div>
 
             {error && <p className="error-message" role="alert">{text.error}</p>}
-            {recommendationError && <p className="error-message" role="alert">{text.recommendationError}</p>}
-            {activeRecommendationParams && (
-              <p className="recommendation-note">{text.recommendationNote}</p>
-            )}
             {pdfError && <p className="error-message" role="alert">{text.pdfError}</p>}
             {popularityError && <p className="error-message" role="alert">{text.popularityError}</p>}
             <section className="popular-panel" aria-labelledby="popular-heading">
